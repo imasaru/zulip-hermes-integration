@@ -911,8 +911,11 @@ class ZulipAdapter(BasePlatformAdapter):
                 stream_id = target["stream_id"]
                 topic = topic_override or metadata.get("topic")
                 if not topic:
-                    topic = self._topic_cache.get(chat_id, "general")
-
+                    topic = self._topic_cache.get(chat_id, self.home_topic)
+                # If still no topic, use the second part of chat_id
+                # (e.g. cron deliver "zulip:614901:inbox-digest" -> topic="inbox-digest")
+                if not topic and len(parts) > 1:
+                    topic = parts[1]
                 result = await asyncio.to_thread(
                     self.client.send_message,
                     {
