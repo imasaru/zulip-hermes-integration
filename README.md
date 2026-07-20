@@ -210,3 +210,24 @@ For detailed agent instructions, see [AGENTS.md](AGENTS.md).
 ## License
 
 MIT License — see [LICENSE](LICENSE) file.
+
+---
+
+## ⚠️ Note: Plugin History & Naming Confusion
+
+This plugin was originally based on [`niyazmft/zulip-hermes-integration`](https://github.com/niyazmft/zulip-hermes-integration), which evolved into a modular 27-commit codebase with separate modules for client, queue, dedupe, reactions, media, etc.
+
+At some point, a second Zulip plugin from [`apresourcing/hermes-zulip`](https://github.com/apresourcing/hermes-zulip) (a simple single-file `plugins/platforms/zulip/adapter.py`) was also present on this system. The two repos had overlapping functionality and similar naming, which caused confusion during agent-assisted development — agents working on both ended up merging concepts from both repos into a single flat `zulip_adapter.py` (866 lines) that replaced the entire upstream modular structure.
+
+**What went wrong:**
+- Two Zulip plugins with similar names on the same system
+- Agents couldn't distinguish which repo was the "real" upstream
+- The result was a single-file rewrite that discarded upstream's modular architecture
+
+**Lessons learned:**
+- **Name plugins distinctly** — avoid overlapping names like `zulip-hermes-integration` vs `hermes-zulip`
+- **One plugin per function** — don't maintain two Zulip integrations on the same agent
+- **Lock the upstream** — before agents start working, pin which repo is the authoritative source
+- **Document the source of truth** — make it obvious which repo agents should base changes on
+
+The flattened `zulip_adapter.py` rewrite was archived on the `zulip-adapter-rewrite-archive` branch for reference. This branch (`main`) stays aligned with upstream's modular architecture.
