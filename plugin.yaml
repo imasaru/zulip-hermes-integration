@@ -1,0 +1,36 @@
+name: zulip
+label: Zulip Integration
+kind: platform
+version: 1.0.0
+description: Zulip platform adapter for Hermes from niyazmft/zulip-hermes-integration
+author: Niyaz Almufti / Nous Research
+requires_env:
+  - name: ZULIP_SITE
+    description: Zulip server URL, e.g., https://smov.zulipchat.com
+    prompt: Zulip server URL
+    password: false
+  - name: ZULIP_EMAIL
+    description: Zulip bot email address
+    prompt: Bot email address
+    password: false
+  - name: ZULIP_API_KEY
+    description: Zulip bot API key
+    prompt: Bot API key
+    password: true
+optional_env:
+  - name: ZULIP_ALLOWED_USERS
+    description: Comma-separated list of Zulip user emails allowed to interact
+    prompt: Allowed Zulip user emails
+    password: false
+  - name: ZULIP_ALLOW_ALL_USERS
+    description: Allow any Zulip user (dev only — disables allowlist)
+    prompt: Allow all users? (true/false)
+    password: false
+  - name: ZULIP_HOME_CHANNEL
+    description: Default stream ID for home/cron deliveries
+    prompt: Home channel stream ID for cron delivery
+    password: false
+  - name: ZULIP_HOME_CHANNEL_NAME
+    description: Default Zulip topic name for home/cron deliveries
+    prompt: Home channel topic name
+    password: false
