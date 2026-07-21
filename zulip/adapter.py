@@ -9,11 +9,16 @@ import asyncio
 import logging
 import os
 import re
-import tempfile
-import time
-from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Optional, Any
+
+try:
+    import zulip
+
+    ZULIP_AVAILABLE = True
+except ImportError:
+    zulip = None  # type: ignore
+    ZULIP_AVAILABLE = False
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -23,10 +28,8 @@ from gateway.platforms.base import (
 )
 from gateway.config import Platform, PlatformConfig
 
-# Use relative imports for internal modules so the plugin works
-# regardless of how Hermes loads it (bundled, user path, etc.)
-from .logger import format_zulip_log, mask_pii
-from .text_utils import (
+from zulip.logger import format_zulip_log, mask_pii
+from zulip.text_utils import (
     chunk_text,
     extract_topic_directive,
     strip_onchar_prefix,
@@ -35,135 +38,12 @@ from .text_utils import (
     normalize_mention,
     strip_html_to_text,
 )
-from .media import upload_file_to_zulip
-from .queue_manager import ZulipQueueManager
-from .dedupe_store import ZulipDedupeStore
-from .reactions import ReactionConfig, ReactionLifecycle
-from .version import __version__, __repo__, PLUGIN_FILES
-from .commands import handle_command, is_command
-from .policy import PolicyEngine
-from .accounts import AccountResolver
-from . import updater
-from .probe import probe_zulip, _normalize_base_url
+from zulip.media import upload_file_to_zulip
+from zulip.queue_manager import ZulipQueueManager
+from zulip.dedupe_store import ZulipDedupeStore
+from zulip.reactions import ReactionConfig, ReactionLifecycle
 
 logger = logging.getLogger(__name__)
-
-# Module-level SDK handle — updated by _import_zulip_sdk()
-zulip = None  # type: ignore
-
-# ------------------------------------------------------------------
-# Performance: client + target caching (Issue #49)
-# ------------------------------------------------------------------
-_MAX_CLIENT_CACHE = 50
-_MAX_TARGET_CACHE = 500
-
-_client_cache: OrderedDict[str, Any] = OrderedDict()
-_target_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
-
-
-def _get_cached_client(site: str, email: str, api_key: str, *, _zulip_mod: Any = None) -> Any:
-    """Return a cached Zulip client or create a new one.
-
-    LRU eviction keeps the most-recently-used clients.
-    """
-    key = f"{site}\x00{email}\x00{api_key}"
-    client = _client_cache.pop(key, None)
-    if client is not None:
-        _client_cache[key] = client
-        return client
-
-    _zulip = _zulip_mod or _import_zulip_sdk()
-    if _zulip is None:
-        raise ImportError("zulip package not installed")
-
-    client = _zulip.Client(email=email, api_key=api_key, site=site)
-
-    if len(_client_cache) >= _MAX_CLIENT_CACHE:
-        oldest = next(iter(_client_cache))
-        del _client_cache[oldest]
-
-    _client_cache[key] = client
-    return client
-
-
-def _get_cached_target(chat_id: str) -> dict[str, Any] | None:
-    """Return cached target info or None.
-
-    Target info: {"type": "dm", "user_id": int} | {"type": "stream", "stream_id": int}
-    """
-    info = _target_cache.get(chat_id)
-    if info is not None:
-        # Move to end (most-recently-used)
-        del _target_cache[chat_id]
-        _target_cache[chat_id] = info
-    return info
-
-
-def _set_cached_target(chat_id: str, info: dict[str, Any]) -> None:
-    """Cache parsed target info with LRU eviction."""
-    if chat_id in _target_cache:
-        del _target_cache[chat_id]
-
-    if len(_target_cache) >= _MAX_TARGET_CACHE:
-        oldest = next(iter(_target_cache))
-        del _target_cache[oldest]
-
-    _target_cache[chat_id] = info
-
-
-def _parse_target(chat_id: str) -> dict[str, Any]:
-    """Parse chat_id into target info, using cache if available."""
-    cached = _get_cached_target(chat_id)
-    if cached is not None:
-        return cached
-
-    if chat_id.startswith("dm:"):
-        info = {"type": "dm", "user_id": int(chat_id[3:])}
-    else:
-        info = {"type": "stream", "stream_id": int(chat_id)}
-
-    _set_cached_target(chat_id, info)
-    return info
-
-
-def _clear_caches() -> None:
-    """Clear all caches. Used by tests and for resource cleanup."""
-    _client_cache.clear()
-    _target_cache.clear()
-ZULIP_AVAILABLE = False
-
-
-def _import_zulip_sdk():
-    """Lazy-import the zulip SDK, bypassing plugin shadow if needed.
-
-    Hermes adds ~/.hermes/plugins/ to sys.path, so a directory named
-    'zulip' shadows the pip-installed zulip package. We temporarily
-    remove the shadowed entry from sys.modules to force Python to
-    re-resolve to the real SDK.
-    """
-    import sys
-
-    global ZULIP_AVAILABLE, zulip
-    if ZULIP_AVAILABLE and zulip is not None:
-        return zulip
-
-    # Remove any shadowed plugin entry so Python resolves the real SDK
-    _shadow = sys.modules.pop("zulip", None)
-    try:
-        import zulip as _sdk
-
-        zulip = _sdk
-        ZULIP_AVAILABLE = True
-        return _sdk
-    except ImportError:
-        zulip = None
-        ZULIP_AVAILABLE = False
-        return None
-    finally:
-        # Restore the shadowed plugin entry so Hermes/other imports
-        # that expect the zulip package continue to work
-        if _shadow is not None:
-            sys.modules["zulip"] = _shadow
 
 
 # Chunking defaults (overridable via env)
@@ -191,23 +71,6 @@ def _resolve_chatmode() -> tuple[str, list[str], bool]:
     return mode, prefixes, require_mention
 
 
-def _safe_delete_temp_file(file_path: str) -> None:
-    """Delete a local file only if it resides under /tmp or a bot workspace.
-
-    Prevents accidental deletion of user-owned files outside temp dirs.
-    Errors are logged, not raised.
-    """
-    try:
-        p = Path(file_path).resolve()
-        tmp = Path(tempfile.gettempdir()).resolve()
-        ws = tmp / "hermes_bot_workspace"
-        if str(p).startswith(str(tmp)) or str(p).startswith(str(ws)):
-            p.unlink()
-            logger.debug("cleaned up temp file [path=%s]", file_path)
-    except OSError as e:
-        logger.warning("temp file cleanup failed [path=%s]: %s", file_path, e)
-
-
 class ZulipAdapter(BasePlatformAdapter):
     """Zulip platform adapter for Hermes Gateway."""
 
@@ -218,16 +81,12 @@ class ZulipAdapter(BasePlatformAdapter):
         self.api_key = os.getenv("ZULIP_API_KEY") or extra.get("api_key", "")
         self.email = os.getenv("ZULIP_EMAIL") or extra.get("email", "")
         self.site = os.getenv("ZULIP_SITE") or extra.get("site", "")
+        self.home_topic = (
+            os.getenv("ZULIP_HOME_CHANNEL_NAME")
+            or extra.get("home_topic", "general")
+        )
 
-        # Validate site URL to prevent SSRF before creating client
-        if self.site:
-            validated = _normalize_base_url(self.site)
-            if not validated:
-                raise ValueError(f"Invalid or unsafe ZULIP_SITE: {self.site}")
-            self.site = validated
-
-        _zulip = _import_zulip_sdk()
-        if not _zulip:
+        if not ZULIP_AVAILABLE:
             logger.error(
                 "zulip package not installed. Run: pip install zulip"
             )
@@ -235,27 +94,14 @@ class ZulipAdapter(BasePlatformAdapter):
                 "zulip package not installed. Run: pip install zulip"
             )
 
-        # Use cached client if available (avoids repeated base64 encoding + object creation)
-        self.client = _get_cached_client(self.site, self.email, self.api_key, _zulip_mod=_zulip)
+        self.client = zulip.Client(
+            email=self.email,
+            api_key=self.api_key,
+            site=self.site,
+        )
 
         # Track latest topic per stream so replies stay threaded
         self._topic_cache: dict[str, str] = {}
-        # Pending placeholder message IDs for editing (chat_id → deque of msg_ids)
-        self._pending_placeholders: dict[str, deque[int]] = {}
-        # Context-mitigation state
-        self._last_topic_cache: dict[str, str] = {}      # stream_id → previous topic
-        self._message_counts: dict[str, int] = {}        # chat_id → message count
-        self._last_message_time: dict[str, float] = {}   # chat_id → last message epoch
-
-        # Placeholder editing config (default: true, set false to disable)
-        self._edit_placeholder_enabled = (
-            os.getenv("ZULIP_EDIT_PLACEHOLDER", "").strip().lower() not in ("false", "0", "no", "off")
-        )
-
-        # Block streaming config (Issue #49 — requires gateway-level streaming support)
-        self._block_streaming = (
-            os.getenv("ZULIP_BLOCK_STREAMING", "").strip().lower() in ("true", "1", "yes", "on")
-        )
 
         self._data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
 
@@ -278,85 +124,19 @@ class ZulipAdapter(BasePlatformAdapter):
         # Reaction config
         self._reaction_cfg = ReactionConfig.from_env()
 
-        # DM policy engine (Issue #48 — controls who can DM the bot)
-        self._policy = PolicyEngine()
-
         self._listening = False
         self._event_task: Optional[asyncio.Task] = None
-        self._presence_task: Optional[asyncio.Task] = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Initialize connection and start listening."""
         logger.info("Zulip adapter connecting...")
-
-        # 0. Pre-flight health probe (side-effect free)
-        probe_result = await probe_zulip(self.site, self.email, self.api_key, timeout=10)
-        if not probe_result.get("ok"):
-            error = probe_result.get("error", "unknown")
-            logger.error(
-                format_zulip_log(
-                    "zulip probe failed",
-                    site=mask_pii(self.site),
-                    error=error,
-                )
-            )
-            raise ConnectionError(f"Zulip probe failed: {error}")
-
-        bot = probe_result.get("bot", {})
-        logger.info(
-            format_zulip_log(
-                "zulip probe ok",
-                bot=mask_pii(bot.get("full_name", "Unknown")),
-                id=bot.get("id"),
-            )
-        )
-
-        # 1. Verify server is reachable (no auth required)
         try:
-            settings = await asyncio.to_thread(self.client.get_server_settings)
-            if settings.get("result") != "success":
-                raise ConnectionError(
-                    f"Cannot reach Zulip server: {self.site}"
-                )
-        except Exception as e:
-            logger.error("Zulip server unreachable: %s", e)
-            raise ConnectionError(f"Cannot reach Zulip server: {self.site}") from e
-
-        # 2. Validate credentials with lightweight profile call
-        try:
-            result = await asyncio.to_thread(self.client.get_profile)
+            result = await asyncio.to_thread(self.client.get_members)
             if result.get("result") != "success":
-                raise ConnectionError(f"Zulip authentication failed: {result}")
-            bot_name = result.get("full_name", "Unknown")
-            logger.info(
-                format_zulip_log(
-                    "zulip bot authenticated",
-                    bot=mask_pii(bot_name),
-                )
-            )
+                raise ConnectionError(f"Zulip connection failed: {result}")
         except Exception as e:
-            logger.error("Zulip authentication error: %s", e)
+            logger.error(f"Zulip connection error: {e}")
             raise
-
-        # 3. Log subscriptions so admins know what streams the bot sees
-        try:
-            subs = await asyncio.to_thread(self.client.get_subscriptions)
-            if subs.get("result") == "success":
-                stream_names = [s["name"] for s in subs.get("subscriptions", [])]
-                if stream_names:
-                    logger.info(
-                        "zulip bot subscribed to %d stream(s): %s",
-                        len(stream_names),
-                        ", ".join(stream_names),
-                    )
-                else:
-                    logger.warning(
-                        "zulip bot not subscribed to any streams — "
-                        "stream messages will be invisible"
-                    )
-        except Exception:
-            # Non-fatal: subscription info is advisory
-            pass
 
         logger.info(
             format_zulip_log(
@@ -364,19 +144,6 @@ class ZulipAdapter(BasePlatformAdapter):
                 site=mask_pii(self.site),
             )
         )
-
-        # Structured health status for monitoring tools
-        logger.info(
-            "health_status=connected platform=zulip site=%s account=%s",
-            mask_pii(self.site),
-            mask_pii(self.email),
-        )
-
-        # Start presence heartbeat so bot appears online
-        self._presence_task = asyncio.create_task(self._presence_heartbeat())
-
-        # Check for plugin updates on startup
-        updater.startup_version_check(__version__, __repo__)
 
         # Ensure queue is registered before starting listener
         await self._queue_mgr.ensure_queue()
@@ -401,31 +168,8 @@ class ZulipAdapter(BasePlatformAdapter):
                 await self._event_task
             except asyncio.CancelledError:
                 pass
-        if self._presence_task:
-            self._presence_task.cancel()
-            try:
-                await self._presence_task
-            except asyncio.CancelledError:
-                pass
         self._mark_disconnected()
         logger.info("Zulip adapter disconnected")
-        logger.info(
-            "health_status=disconnected platform=zulip site=%s account=%s",
-            mask_pii(self.site),
-            mask_pii(self.email),
-        )
-
-    async def _presence_heartbeat(self):
-        """Keep bot presence active while connected."""
-        while self._listening:
-            try:
-                await asyncio.to_thread(
-                    self.client.update_presence,
-                    {"status": "active", "ping_only": False},
-                )
-            except Exception:
-                pass  # presence is best-effort
-            await asyncio.sleep(60)
 
     async def _listen_for_events(self):
         """Listen for incoming Zulip messages via persistent event queue."""
@@ -572,99 +316,6 @@ class ZulipAdapter(BasePlatformAdapter):
             if was_mentioned and mention_regex:
                 content = normalize_mention(content, mention_regex)
 
-        # --- Command interception (before placeholders / AI dispatch) ---
-        if is_command(content):
-            sender_email = message.get("sender_email", "")
-            sender_full_name = message.get("sender_full_name", "")
-            # Determine chat_id early for command replies
-            if msg_type == "stream":
-                cmd_chat_id = str(message.get("stream_id", ""))
-                cmd_topic = message.get("subject", "")
-            else:
-                cmd_chat_id = f"dm:{message.get('sender_id', '')}"
-                cmd_topic = None
-
-            cmd_result = handle_command(
-                content=content,
-                chat_id=cmd_chat_id,
-                sender_email=sender_email,
-                sender_name=sender_full_name,
-                version=__version__,
-            )
-            if cmd_result.handled:
-                # Send command reply directly
-                try:
-                    if msg_type == "stream":
-                        await asyncio.to_thread(
-                            self.client.send_message,
-                            {
-                                "type": "stream",
-                                "to": message.get("stream_id"),
-                                "topic": cmd_topic,
-                                "content": cmd_result.reply,
-                            },
-                        )
-                    else:
-                        await asyncio.to_thread(
-                            self.client.send_message,
-                            {
-                                "type": "private",
-                                "to": [message.get("sender_id")],
-                                "content": cmd_result.reply,
-                            },
-                        )
-                except Exception as e:
-                    logger.warning("command reply failed: %s", e)
-                # Mark message as read and stop processing
-                try:
-                    await asyncio.to_thread(
-                        self.client.update_message_flags,
-                        {"messages": [message_id], "op": "add", "flag": "read"},
-                    )
-                except Exception:
-                    pass
-                return
-
-        # --- DM policy check (Issue #48) ---
-        if msg_type == "private":
-            sender_email = message.get("sender_email", "")
-            allowed, pairing_code = self._policy.check_dm(sender_email)
-            if not allowed:
-                reply = ""
-                if pairing_code:
-                    reply = (
-                        f"👋 Hi! You need to be approved before messaging this bot.\n\n"
-                        f"Your pairing code: **PAIR-{pairing_code}**\n\n"
-                        f"Share this code with your admin to get access."
-                    )
-                elif self._policy.mode == "disabled":
-                    reply = "🚫 DMs to this bot are currently disabled."
-                else:
-                    reply = "🚫 You are not authorized to message this bot."
-
-                try:
-                    await asyncio.to_thread(
-                        self.client.send_message,
-                        {
-                            "type": "private",
-                            "to": [message.get("sender_id")],
-                            "content": reply,
-                        },
-                    )
-                except Exception as e:
-                    logger.warning("DM policy rejection failed: %s", e)
-
-                # Mark message as read and stop processing
-                try:
-                    await asyncio.to_thread(
-                        self.client.update_message_flags,
-                        {"messages": [message_id], "op": "add", "flag": "read"},
-                    )
-                except Exception:
-                    pass
-                logger.info("zulip DM blocked [policy=%s sender=%s]", self._policy.mode, sender_email)
-                return
-
         if msg_type == "stream":
             stream_id = message.get("stream_id")
             topic = message.get("subject", "")
@@ -673,25 +324,6 @@ class ZulipAdapter(BasePlatformAdapter):
             # Cache topic for reply threading
             chat_id = str(stream_id)
             self._topic_cache[chat_id] = topic
-
-            # Send placeholder if editing is enabled
-            if self._edit_placeholder_enabled:
-                try:
-                    ph_result = await asyncio.to_thread(
-                        self.client.send_message,
-                        {
-                            "type": "stream",
-                            "to": stream_id,
-                            "topic": topic,
-                            "content": "🤔 Thinking...",
-                        },
-                    )
-                    if ph_result.get("result") == "success":
-                        self._pending_placeholders.setdefault(chat_id, deque()).append(
-                            ph_result["id"]
-                        )
-                except Exception:
-                    pass  # placeholder is best-effort
 
             source = self.build_source(
                 chat_id=chat_id,
@@ -705,24 +337,6 @@ class ZulipAdapter(BasePlatformAdapter):
             sender_id = message.get("sender_id")
             chat_id = f"dm:{sender_id}"
 
-            # Send placeholder if editing is enabled (DMs too)
-            if self._edit_placeholder_enabled:
-                try:
-                    ph_result = await asyncio.to_thread(
-                        self.client.send_message,
-                        {
-                            "type": "private",
-                            "to": [sender_id],
-                            "content": "🤔 Thinking...",
-                        },
-                    )
-                    if ph_result.get("result") == "success":
-                        self._pending_placeholders.setdefault(chat_id, deque()).append(
-                            ph_result["id"]
-                        )
-                except Exception:
-                    pass  # placeholder is best-effort
-
             source = self.build_source(
                 chat_id=chat_id,
                 chat_name=sender_full_name,
@@ -731,29 +345,6 @@ class ZulipAdapter(BasePlatformAdapter):
                 user_name=sender_full_name,
             )
             extra_meta = {"user_id": sender_id, "user_email": sender_email}
-
-        # --- Context-mitigation metadata ---
-        now = time.time()
-        msg_count = self._message_counts.get(chat_id, 0) + 1
-        self._message_counts[chat_id] = msg_count
-
-        last_time = self._last_message_time.get(chat_id)
-        session_gap = (now - last_time) if last_time else 0
-        self._last_message_time[chat_id] = now
-
-        # Detect topic change in streams
-        topic_changed = False
-        if msg_type == "stream":
-            prev_topic = self._last_topic_cache.get(chat_id)
-            if prev_topic and prev_topic != topic:
-                topic_changed = True
-            self._last_topic_cache[chat_id] = topic
-
-        extra_meta.update({
-            "conversation_turn": msg_count,
-            "session_gap_seconds": round(session_gap, 1),
-            "topic_changed": topic_changed,
-        })
 
         event = MessageEvent(
             text=content,
@@ -768,17 +359,6 @@ class ZulipAdapter(BasePlatformAdapter):
             await reactions.success()
         except Exception:
             await reactions.error()
-            # Clean up orphaned placeholder if present
-            orphaned_queue = self._pending_placeholders.get(chat_id)
-            if orphaned_queue:
-                try:
-                    orphaned_id = orphaned_queue.popleft()
-                    await asyncio.to_thread(
-                        self.client.update_message,
-                        {"message_id": orphaned_id, "content": "❌ Error — could not generate response"},
-                    )
-                except Exception:
-                    pass  # best-effort cleanup
             raise
         finally:
             if typing_params:
@@ -789,14 +369,6 @@ class ZulipAdapter(BasePlatformAdapter):
                     )
                 except Exception:
                     pass
-            # Mark message as read (best-effort)
-            try:
-                await asyncio.to_thread(
-                    self.client.update_message_flags,
-                    {"messages": [message_id], "op": "add", "flag": "read"},
-                )
-            except Exception:
-                pass
 
     async def send(
         self,
@@ -812,7 +384,6 @@ class ZulipAdapter(BasePlatformAdapter):
 
         # Upload files first
         uploaded_urls = []
-        uploaded_local_paths = []
         if media_files:
             data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
             for file_path in media_files:
@@ -821,13 +392,8 @@ class ZulipAdapter(BasePlatformAdapter):
                         self.client, file_path, data_dir
                     )
                     uploaded_urls.append(url)
-                    uploaded_local_paths.append(file_path)
                 except Exception as e:
                     logger.error("zulip upload failed [file=%s]: %s", file_path, e)
-
-        # Clean up local temp files after upload (best-effort)
-        for local_path in uploaded_local_paths:
-            _safe_delete_temp_file(local_path)
 
         # Append uploaded file links to content
         if uploaded_urls:
@@ -848,10 +414,8 @@ class ZulipAdapter(BasePlatformAdapter):
 
         last_result: Optional[SendResult] = None
 
-        # When block streaming is enabled, send each chunk as a separate message
-        # immediately. This requires gateway-level support (not yet implemented).
         for idx, chunk in enumerate(chunks):
-            result = await self._send_single(chat_id, chunk, metadata, topic_override, reply_to)
+            result = await self._send_single(chat_id, chunk, metadata, topic_override)
             last_result = result
             if not result.success:
                 logger.error(
@@ -869,53 +433,29 @@ class ZulipAdapter(BasePlatformAdapter):
         content: str,
         metadata: dict,
         topic_override: Optional[str],
-        reply_to: Optional[int] = None,
     ) -> SendResult:
-        """Send a single (unchunked) message, editing placeholder if present."""
-        # Check for pending placeholder to edit instead of sending new
-        placeholder_id: Optional[int] = None
-        orphaned_queue = self._pending_placeholders.get(chat_id)
-        if orphaned_queue:
-            try:
-                placeholder_id = orphaned_queue.popleft()
-            except IndexError:
-                placeholder_id = None
-        if placeholder_id is not None:
-            try:
-                result = await asyncio.to_thread(
-                    self.client.update_message,
-                    {"message_id": placeholder_id, "content": content},
-                )
-                if result.get("result") == "success":
-                    logger.debug("zulip placeholder edited for %s", chat_id)
-                    return SendResult(
-                        success=True, message_id=str(placeholder_id)
-                    )
-                # If edit fails, fall through to normal send
-            except Exception:
-                pass  # fall through to normal send
-
+        """Send a single (unchunked) message."""
         try:
-            target = _parse_target(chat_id)
-            if target["type"] == "dm":
+            if chat_id.startswith("dm:"):
+                user_id = int(chat_id[3:])
                 result = await asyncio.to_thread(
                     self.client.send_message,
                     {
                         "type": "private",
-                        "to": [target["user_id"]],
+                        "to": [user_id],
                         "content": content,
-                        "reply_to": reply_to,
                     },
                 )
             else:
-                stream_id = target["stream_id"]
+                stream_id = int(chat_id)
                 topic = topic_override or metadata.get("topic")
                 if not topic:
                     topic = self._topic_cache.get(chat_id, self.home_topic)
                 # If still no topic, use the second part of chat_id
-                # (e.g. cron deliver "zulip:614901:inbox-digest" -> topic="inbox-digest")
+                # (e.g. cron deliver "zulip:614901:inbox-digest" → topic="inbox-digest")
                 if not topic and len(parts) > 1:
                     topic = parts[1]
+
                 result = await asyncio.to_thread(
                     self.client.send_message,
                     {
@@ -923,7 +463,6 @@ class ZulipAdapter(BasePlatformAdapter):
                         "to": stream_id,
                         "topic": topic,
                         "content": content,
-                        "reply_to": reply_to,
                     },
                 )
 
@@ -955,7 +494,7 @@ class ZulipAdapter(BasePlatformAdapter):
 
 def check_requirements() -> bool:
     """Return True if the zulip SDK is installed."""
-    return _import_zulip_sdk() is not None
+    return ZULIP_AVAILABLE
 
 
 def validate_config(config) -> bool:
@@ -976,7 +515,78 @@ def _env_enablement() -> dict | None:
     if not (key and email and site):
         return None
 
-    return {"api_key": key, "email": email, "site": site}
+    seed = {"api_key": key, "email": email, "site": site}
+    home = os.getenv("ZULIP_HOME_CHANNEL", "").strip()
+    if home:
+        seed["home_channel"] = {
+            "chat_id": home,
+            "name": os.getenv("ZULIP_HOME_CHANNEL_NAME", "general"),
+        }
+    return seed
+
+
+async def _standalone_send(
+    pconfig,
+    chat_id,
+    message,
+    *,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+):
+    """Send from cron without a live gateway adapter."""
+    if not ZULIP_AVAILABLE:
+        return {"error": "zulip package not installed"}
+
+    extra = getattr(pconfig, "extra", {}) or {}
+    email = extra.get("email")
+    api_key = extra.get("api_key")
+    site = extra.get("site")
+    home_topic = extra.get("home_topic", "general")
+
+    if not (email and api_key and site):
+        return {"error": "Zulip credentials missing in platform config"}
+
+    try:
+        client = zulip.Client(email=email, api_key=api_key, site=site)
+
+        if chat_id.startswith("dm:"):
+            user_id = int(chat_id[3:])
+            result = await asyncio.to_thread(
+                client.send_message,
+                {
+                    "type": "private",
+                    "to": [user_id],
+                    "content": message,
+                },
+            )
+        else:
+            topic = thread_id or home_topic
+            # Parse chat_id as "stream_id:topic" if it contains a colon
+            if ":" in chat_id:
+                parts = chat_id.rsplit(":", 1)
+                stream_id = int(parts[0])
+                if not topic:
+                    topic = parts[1]
+            else:
+                stream_id = int(chat_id)
+            result = await asyncio.to_thread(
+                client.send_message,
+                {
+                    "type": "stream",
+                    "to": stream_id,
+                    "topic": topic,
+                    "content": message,
+                },
+            )
+
+        if result.get("result") == "success":
+            return {"success": True, "message_id": str(result.get("id", ""))}
+        else:
+            return {"error": f"Zulip send failed: {result}"}
+
+    except Exception as e:
+        return {"error": f"Zulip standalone send error: {e}"}
 
 
 def interactive_setup() -> None:
@@ -1043,6 +653,25 @@ def interactive_setup() -> None:
     if allowed:
         save_env_value("ZULIP_ALLOWED_USERS", allowed.strip())
 
+    # Home channel for cron deliveries (optional)
+    home = prompt(
+        "Home stream ID for cron deliveries (numeric, or empty to set later)",
+        default=get_env_value("ZULIP_HOME_CHANNEL") or "",
+    )
+    if home:
+        try:
+            int(home)
+            save_env_value("ZULIP_HOME_CHANNEL", home.strip())
+        except ValueError:
+            print_warning(f"Invalid stream ID '{home}' — must be numeric")
+
+    home_topic = prompt(
+        "Default topic for cron deliveries (default: general)",
+        default=get_env_value("ZULIP_HOME_CHANNEL_NAME") or "general",
+    )
+    if home_topic:
+        save_env_value("ZULIP_HOME_CHANNEL_NAME", home_topic.strip())
+
     print_success("Zulip configured.")
     print_info("Tip: Subscribe your bot to streams via Stream settings → Subscribers")
 
@@ -1058,6 +687,8 @@ def register(ctx):
         required_env=["ZULIP_API_KEY", "ZULIP_EMAIL", "ZULIP_SITE"],
         install_hint="pip install zulip",
         env_enablement_fn=_env_enablement,
+        cron_deliver_env_var="ZULIP_HOME_CHANNEL",
+        standalone_sender_fn=_standalone_send,
         allowed_users_env="ZULIP_ALLOWED_USERS",
         allow_all_env="ZULIP_ALLOW_ALL_USERS",
         max_message_length=10000,
