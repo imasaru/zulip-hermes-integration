@@ -1,36 +1,86 @@
-# 📬 Zulip Plugin for Hermes
+# 📬 Zulip Plugin for Hermes Agent
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://python.org)
-[![Tests](https://img.shields.io/badge/tests-256%20passing-brightgreen)](https://github.com/niyazmft/zulip-hermes-integration/actions)
-[![Latest Release](https://img.shields.io/github/v/release/niyazmft/zulip-hermes-integration?label=release)](https://github.com/niyazmft/zulip-hermes-integration/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Hermes](https://img.shields.io/badge/hermes-%3E%3D0.18.2-orange)](https://hermes-agent.nousresearch.com)
 
-**Connect your Hermes AI agent to Zulip.** Chat with Hermes via **streams** (with automatic topic threading) or **DMs**. Supports admin commands, secure DM policies, file uploads, and health monitoring.
+A [Hermes Agent](https://hermes-agent.nousresearch.com) gateway plugin that adds **Zulip** as a first-class messaging platform. Chat with Hermes via Zulip streams (with topic-aware threading) and DMs, schedule cron deliveries, and send automated notifications.
 
-> 💡 **What this does:** Your Zulip bot becomes a doorway to your Hermes AI. Users type in Zulip, the AI thinks, the bot replies — all while keeping conversations threaded by topic.
+> 🍴 **This is a fork of [`niyazmft/zulip-hermes-integration`](https://github.com/niyazmft/zulip-hermes-integration).**
+>
+> **What we preserve:** The cron delivery feature (`ZULIP_HOME_CHANNEL` / `deliver=zulip:stream_id`) that upstream removed in commit [`8685a60`](https://github.com/niyazmft/zulip-hermes-integration/commit/8685a60) (PR #34).
+>
+> **What we add:**
+> - Cron delivery topic routing — parse `zulip:stream_id:topic` from the `deliver` string so messages land in the correct topic, not "general"
+> - `reply_to` parameter wired into the Zulip API for proper message threading
+>
+> **What we don't touch:** Everything else is upstream — the modular plugin architecture, SDK integration, event queue, and all other features.
 
----
+## Features
 
-## 🚀 Quickstart — Running in 2 Minutes
+- ✅ Bi-directional chat via Zulip **streams** (with automatic topic threading) and **DMs**
+- ✅ Cron job deliveries to Zulip streams via `deliver=zulip:stream_id`
+- ✅ `send_message` tool for automated outbound notifications
+- ✅ User authorization via email allowlist
+- ✅ Interactive onboarding via `hermes gateway setup`
+- ✅ Zero core code changes — pure plugin architecture
 
-### 1. Install the Zulip SDK (one-time)
+## Table of Contents
+
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Architecture](#architecture)
+- [Environment Variables](#environment-variables)
+- [Troubleshooting](#troubleshooting)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Installation
+
+### Prerequisites
+
+- Python 3.8+
+- Hermes Agent ≥ v0.18.2
+- **Zulip SDK** (`zulip`): must be installed in the same Python environment as Hermes
+- A Zulip bot account ([create one here](https://zulipchat.com/help/add-a-bot))
+
+> ⚠️ **Runtime Dependency:** The `zulip` Python package is a runtime dependency of this plugin. If you are running Hermes inside a Docker container, ensure `zulip` is either baked into the image (e.g. `RUN pip install zulip` in the Dockerfile) or auto-installed on container startup. Manual `pip install` inside a running container will be lost on restart.
+
+### Option A: User Plugin (Recommended)
 
 ```bash
-pip install "zulip>=0.9.0"
-```
-
-> ⚠️ Hermes doesn't auto-install plugin dependencies. Run this once in the same Python environment as Hermes.
-
-### 2. Install the Plugin
-
-```bash
-mkdir -p ~/.hermes/plugins
-rm -rf ~/.hermes/plugins/zulip
-git clone https://github.com/niyazmft/zulip-hermes-integration.git ~/.hermes/plugins/zulip
+mkdir -p ~/.hermes/plugins/zulip
+cp zulip/__init__.py zulip/adapter.py zulip/plugin.yaml ~/.hermes/plugins/zulip/
 hermes plugins enable zulip
 ```
 
-### 3. Configure
+### Option B: Bundled Plugin (Containers / System-wide)
+
+```bash
+HERMES_PATH=$(python3 -c "import hermes_cli; print(hermes_cli.__path__[0])")
+mkdir -p "$HERMES_PATH/../plugins/platforms/zulip"
+cp zulip/__init__.py zulip/adapter.py zulip/plugin.yaml "$HERMES_PATH/../plugins/platforms/zulip/"
+```
+
+## Configuration
+
+### Interactive Setup (Recommended)
+
+```bash
+hermes gateway setup
+```
+
+Select **📬 Zulip** from the menu. The wizard will prompt for:
+- Zulip site URL (e.g. `https://your-org.zulipchat.com`)
+- Bot email address
+- Bot API key (password-masked)
+- Allowed users (optional)
+- Home stream ID & topic for cron deliveries (optional)
+
+Values are saved to `~/.hermes/.env` automatically.
+
+### Manual Configuration
 
 Add to `~/.hermes/.env`:
 
@@ -38,6 +88,9 @@ Add to `~/.hermes/.env`:
 ZULIP_API_KEY=your-bot-api-key
 ZULIP_EMAIL=your-bot@niyaz.zulipchat.com
 ZULIP_SITE=https://niyaz.zulipchat.com
+ZULIP_ALLOWED_USERS=your-email@niyaz.zulipchat.com
+ZULIP_HOME_CHANNEL=573423
+ZULIP_HOME_CHANNEL_NAME=general
 ```
 
 Then add to `~/.hermes/config.yaml`:
@@ -49,235 +102,121 @@ gateway:
       enabled: true
 ```
 
-### 4. Start
+### Subscribe Bot to Streams
+
+By default, the bot only sees DMs and @-mentions. To receive all messages in a stream:
+
+1. Go to **Stream settings → Subscribers**
+2. Add your bot
+
+## Usage
+
+### Start the Gateway
 
 ```bash
 hermes gateway
 ```
 
-Send a DM or @-mention your bot in a subscribed stream. Done! 🎉
+Send a message to the bot in Zulip (DM or subscribed stream). The bot will respond via the same channel, preserving the topic for stream messages.
 
-**For detailed setup**, see [docs/SETUP.md](docs/SETUP.md).  
-**For admin configuration**, see the [Environment Variables](#environment-variables) section below.
-
----
-
-## ✨ What You Get
-
-### For End Users
-
-| Feature | What it does |
-|---------|-------------|
-| 💬 **Streams + DMs** | Talk to the bot in public streams (with topic threading) or private messages |
-| 🤔 **"Thinking..." placeholder** | Bot shows it's working, then edits with the final answer. No awkward silence. |
-| 📎 **File uploads** | Send CSVs, PDFs, JSON — the bot downloads and can process them |
-| 🏓 **Admin commands** | Type `/help`, `/status`, `/model` for instant responses (no LLM call needed) |
-
-### For Admins
-
-| Feature | What it does |
-|---------|-------------|
-| 🔐 **DM Policies** | Control who can DM: `open`, `allowlist`, `pairing` (code-based onboarding), or `disabled` |
-| 🩺 **Health probe** | Pre-flight server check with SSRF protection + structured `health_status` logging |
-| 🛡️ **Security hardening** | SSRF validation, symlink rejection, path traversal blocking |
-| ⚡ **Performance caching** | LRU client + target caches reduce allocations and speed up sends |
-| 📊 **Context metadata** | Every message carries `conversation_turn`, `session_gap_seconds`, `topic_changed` to help the AI avoid stale responses |
-| 🔄 **One-command updates** | `bash ~/.hermes/plugins/zulip/update.sh` pulls latest and restarts |
-
-### For Developers
-
-| Feature | What it does |
-|---------|-------------|
-| 🔌 **Pure plugin** | Zero changes to Hermes core. Drop in, enable, done. |
-| 🧩 **Extensible commands** | Add custom bot commands with `@register_command` decorator |
-| 📁 **Sandboxed workspace** | Bot can generate files (reports, JSON, CSV) in a temp workspace with auto-cleanup |
-| 🧪 **CI-tested** | 256 tests, pre-push hooks, GitHub Actions branch protection |
-
----
-
-## 🏓 Built-in Commands
-
-Type these in any stream or DM. They're handled instantly — no LLM call:
-
-| Command | Response |
-|---------|----------|
-| `/help` | List all available commands |
-| `/status` | Bot version, repo URL, your email |
-| `/model` | Current model status |
-
-Add your own:
+### Cron Deliveries
 
 ```python
-from zulip.commands import register_command
+from hermes_tools import cronjob
 
-@register_command("ping")
-def _cmd_ping(args, chat_id, sender_email, sender_name):
-    return "🏓 Pong!"
-```
-
----
-
-## 🔐 DM Access Control
-
-Set `ZULIP_DM_POLICY` to control who can message the bot:
-
-| Mode | Behavior | Use case |
-|------|----------|----------|
-| `open` *(default)* | Anyone can DM | Small teams, public bots |
-| `allowlist` | Only `ZULIP_ALLOWED_USERS` can DM | Internal team bots |
-| `pairing` | New users get a pairing code to share with an admin | Moderated onboarding |
-| `disabled` | All DMs blocked | Stream-only bots |
-
-**Pairing mode flow:**
-
-```
-New user DM → "Your pairing code: PAIR-ABC123"
-Admin approves → user can DM normally
-```
-
----
-
-## 📎 Sending Files
-
-The bot can generate and send files as Zulip uploads:
-
-```python
-from zulip.workspace import BotWorkspace
-
-ws = BotWorkspace()
-path = ws.save_text("report.csv", "id,value\n1,42\n")
-
-await adapter.send(
-    chat_id="dm:42",
-    content="Here is your report:",
-    media_files=[path]
+cronjob(
+    action="create",
+    prompt="Check Linear for new issues and summarize",
+    schedule="0 9 * * *",
+    deliver="zulip:573423",
+    extra={"topic": "daily-pulse"},
+    name="Daily Pulse"
 )
 ```
 
-Files appear as clickable links. Temp files auto-delete after upload. Path traversal and symlinks are rejected.
+### Send Message Tool
 
----
+```python
+from hermes_tools import send_message
 
-## 🏗️ Architecture
+# Send to stream
+send_message(
+    platform="zulip",
+    chat_id="573423",
+    message="Hello from Hermes!",
+    extra={"topic": "announcements"}
+)
+
+# Send DM
+send_message(
+    platform="zulip",
+    chat_id="dm:1032616",
+    message="Private notification"
+)
+```
+
+## Architecture
 
 ```
 Zulip Stream/DM
     ↓
 ZulipAdapter._listen_for_events()   # Event queue long-polling
     ↓
-MessageEvent (with topic metadata + context fields)
+MessageEvent (with topic metadata)
     ↓
-Gateway session → AI Agent
+Gateway session → AIAgent
     ↓
 ZulipAdapter.send() → Zulip REST API
 ```
 
-All synchronous SDK calls are wrapped with `asyncio.to_thread()` to keep the gateway event loop responsive.
+The adapter uses Zulip's **event queue API** for inbound messages and wraps all synchronous SDK calls with `asyncio.to_thread()` to keep the gateway event loop responsive.
 
----
+### Chat ID Format
 
-## 🔧 Environment Variables
+| Type | Format | Example |
+|------|--------|---------|
+| Stream | Numeric stream ID | `"573423"` |
+| Private message | `dm:` + user ID | `"dm:1032616"` |
 
-### Required
+For stream messages, the adapter caches the last seen **topic** per stream and uses it for replies, so conversations stay threaded.
 
-| Variable | Example | Description |
-|----------|---------|-------------|
-| `ZULIP_API_KEY` | `abcd1234...` | Bot API key from Zulip settings |
-| `ZULIP_EMAIL` | `bot@company.zulipchat.com` | Bot email address |
-| `ZULIP_SITE` | `https://company.zulipchat.com` | Your Zulip organization URL |
+## Environment Variables
 
-### Optional — Access Control
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ZULIP_API_KEY` | ✅ | Bot API key from Zulip settings |
+| `ZULIP_EMAIL` | ✅ | Bot email address |
+| `ZULIP_SITE` | ✅ | Zulip organization URL |
+| `ZULIP_ALLOWED_USERS` | ❌ | Comma-separated authorized user emails |
+| `ZULIP_ALLOW_ALL_USERS` | ❌ | Set `true` to disable authorization (dev only) |
+| `ZULIP_HOME_CHANNEL` | ❌ | Default stream ID for cron deliveries |
+| `ZULIP_HOME_CHANNEL_NAME` | ❌ | Default topic for cron deliveries |
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ZULIP_ALLOWED_USERS` | *(empty)* | Comma-separated emails allowed to DM |
-| `ZULIP_DM_POLICY` | `open` | `open` / `allowlist` / `pairing` / `disabled` |
+## Troubleshooting
 
-### Optional — Behavior
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ZULIP_CHATMODE` | `onmessage` | Stream trigger: `onmessage` / `oncall` / `onchar` |
-| `ZULIP_REQUIRE_MENTION` | `true` | Stream messages need @mention (except `onmessage`) |
-| `ZULIP_EDIT_PLACEHOLDER` | `true` | Show "Thinking..." placeholder while AI generates |
-| `ZULIP_REACTIONS_ENABLED` | `true` | Emoji reactions (👀/✅/⚠️) for status |
-| `ZULIP_CHUNK_LIMIT` | `4000` | Max chars per message chunk |
-
-### Optional — Advanced
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `ZULIP_CHUNK_MODE` | `length` | Chunking strategy: `length` or `newline` |
-| `ZULIP_ONCHAR_PREFIXES` | `!,>` | Custom onchar triggers |
-| `ZULIP_BLOCK_STREAMING` | `false` | Experimental block streaming |
-| `ZULIP_MEDIA_MAX_MB` | `5` | Max inbound attachment size (MB) |
-| `ZULIP_ALLOW_ALL_USERS` | `false` | Disable all authorization (dev only) |
-
----
-
-## 🆘 Troubleshooting
-
-| Problem | Fix |
-|---------|-----|
-| "zulip package not installed" | Run `pip install "zulip>=0.9.0"` in Hermes's Python env |
-| "No adapter available for zulip" | Check logs for syntax errors; verify `plugin.yaml` is present |
-| Bot not responding in streams | Bot must be **subscribed** to the stream in Zulip settings |
-| "Invalid or unsafe ZULIP_SITE" | Use `https://` URL, not `localhost` or IP addresses |
-| Setup wizard shows instructions only | Ensure `setup_fn=interactive_setup` is passed to `register()` |
+| Problem | Solution |
+|---------|----------|
+| "Can't instantiate abstract class" | Add `async def get_chat_info()` to adapter |
+| "No adapter available for zulip" | Check logs for missing SDK or syntax error |
+| Bot not responding | Verify bot is subscribed to stream; check `ZULIP_ALLOWED_USERS` |
+| Cron delivery fails | Verify `ZULIP_HOME_CHANNEL` is numeric; check bot has send permission |
+| Setup wizard shows instructions only | Ensure `setup_fn=interactive_setup` passed to `register()` |
 
 For detailed agent instructions, see [AGENTS.md](AGENTS.md).
 
----
+## Contributing
 
-## 🔄 Updating
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/my-change`
+3. Make your changes
+4. Test on a Hermes gateway: `python3 -m py_compile zulip/adapter.py`
+5. Submit a pull request
 
-```bash
-# One-command update (downloads latest + restarts Hermes)
-ssh user@device "bash ~/.hermes/plugins/zulip/update.sh"
-```
-
-Or manually:
-
-```bash
-cd ~/.hermes/plugins/zulip
-git pull origin main
-hermes gateway restart
-```
-
----
-
-## 🤝 Contributing
-
-```bash
-# 1. Fork and clone
-git clone https://github.com/YOU/zulip-hermes-integration.git
-cd zulip-hermes-integration
-
-# 2. Install hooks
-bash scripts/setup-hooks.sh
-
-# 3. Make changes
-# ...
-
-# 4. Run checks
-bash .githooks/pre-push
-
-# 5. Submit PR (squash merge, branch protection enforced)
-```
-
-- **256 tests** — run via `pytest tests/`
-- **Pre-push hook** — runs syntax checks + tests before every push
-- **CI** — GitHub Actions `zulip-bridge` job must pass before merge
-- **Branch protection** — requires PR + linear history + squash merge
-
----
-
-## 📚 See Also
+## See Also
 
 - [Hermes Plugin Docs](https://hermes-agent.nousresearch.com/docs/developer-guide/adding-platform-adapters)
 - [Zulip API Documentation](https://zulip.com/api/)
-- [CHANGELOG.md](CHANGELOG.md)
 
 ## License
 
-MIT License — see [LICENSE](LICENSE).
+MIT License — see [LICENSE](LICENSE) file.
