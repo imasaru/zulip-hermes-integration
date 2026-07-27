@@ -415,7 +415,7 @@ class ZulipAdapter(BasePlatformAdapter):
         last_result: Optional[SendResult] = None
 
         for idx, chunk in enumerate(chunks):
-            result = await self._send_single(chat_id, chunk, metadata, topic_override)
+            result = await self._send_single(chat_id, chunk, metadata, topic_override, reply_to)
             last_result = result
             if not result.success:
                 logger.error(
@@ -433,6 +433,7 @@ class ZulipAdapter(BasePlatformAdapter):
         content: str,
         metadata: dict,
         topic_override: Optional[str],
+        reply_to: Optional[int] = None,
     ) -> SendResult:
         """Send a single (unchunked) message."""
         try:
@@ -444,6 +445,7 @@ class ZulipAdapter(BasePlatformAdapter):
                         "type": "private",
                         "to": [user_id],
                         "content": content,
+                        "reply_to": reply_to,
                     },
                 )
             else:
@@ -463,6 +465,7 @@ class ZulipAdapter(BasePlatformAdapter):
                         "to": stream_id,
                         "topic": topic,
                         "content": content,
+                        "reply_to": reply_to,
                     },
                 )
 
