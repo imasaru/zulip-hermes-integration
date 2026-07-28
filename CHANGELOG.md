@@ -22,6 +22,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Gateway streaming support**: `edit_message()` + `supports_draft_streaming()` so Hermes can progressive-edit replies when `display.platforms.zulip.streaming` is enabled (still off by default — EDITED-tag UX)
+- **Topic title sync**: `rename_topic()` via Zulip `move_topic`, used by gateway `/title` and auto-title for Zulip stream sessions
+- **Handoff topics**: `create_handoff_thread()` seeds a dedicated Zulip topic for CLI/session handoffs
+- **Topic-aware inbound routing**: stream messages now set `chat_type="thread"` + `thread_id`/`chat_topic` so gateway session keys, title rename, and approvals bind to the Zulip topic
+- **Local slash commands wired**: `/help`, `/status`, `/model` handled in-plugin; `/stop` and other unknown slash commands fall through to the Hermes gateway
 - **Persistent Event Queue**: `ZulipQueueManager` persists `queue_id` + `last_event_id` to disk, survives gateway restarts, handles `BAD_EVENT_QUEUE_ID` gracefully
 - **Message Deduplication**: `ZulipDedupeStore` prevents duplicate processing with 5-minute TTL and debounced disk persistence
 - **Text Processing**: `strip_html_to_text()`, `chunk_text()` (length/newline modes), `extract_topic_directive()` for inline topic changes
@@ -31,6 +36,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Outbound Uploads**: Send files via `/user_uploads` with path traversal security
 - **Stream Trigger Modes**: `onmessage` (all), `oncall` (mention only), `onchar` (prefix trigger) with `ZULIP_CHATMODE`
 - **Structured Logging**: Machine-parseable `[k=v]` format with PII masking for emails, IDs, and stream names
+
+### Fixed
+- `_send_single` topic resolution: honor `metadata.thread_id`, `stream_id:topic` chat ids, and no longer reference an undefined `parts` variable
+- Outbound replies now prefer the conversation topic (`thread_id`) over the home/default topic
 
 ### Changed
 - `adapter.py` refactored to use all new modules: queue manager, dedupe store, reactions, chunking, triggers, logging

@@ -13,6 +13,12 @@ A [Hermes Agent](https://hermes-agent.nousresearch.com) gateway plugin that adds
 > **What we add:**
 > - Cron delivery topic routing — parse `zulip:stream_id:topic` from the `deliver` string so messages land in the correct topic, not "general"
 > - `reply_to` parameter wired into the Zulip API for proper message threading
+> - Gateway integration features ported from the earlier feature-rich adapter work:
+>   - `edit_message` + opt-in draft streaming
+>   - `rename_topic` for Hermes session title ↔ Zulip topic sync
+>   - `create_handoff_thread` for CLI handoffs
+>   - topic-aware inbound routing (`chat_type=thread` + `thread_id`)
+>   - local `/help`/`/status`/`/model`; `/stop` falls through to Hermes gateway
 >
 > **What we don't touch:** Everything else is upstream — the modular plugin architecture, SDK integration, event queue, and all other features.
 
@@ -21,6 +27,10 @@ A [Hermes Agent](https://hermes-agent.nousresearch.com) gateway plugin that adds
 - ✅ Bi-directional chat via Zulip **streams** (with automatic topic threading) and **DMs**
 - ✅ Cron job deliveries to Zulip streams via `deliver=zulip:stream_id`
 - ✅ `send_message` tool for automated outbound notifications
+- ✅ Session title ↔ Zulip topic rename (`/title`, auto-title)
+- ✅ Opt-in progressive streaming via `edit_message` (`display.platforms.zulip.streaming`)
+- ✅ CLI handoff topics + gateway slash fallthrough (`/stop`)
+- ✅ Local admin commands (`/help`, `/status`, `/model`)
 - ✅ User authorization via email allowlist
 - ✅ Interactive onboarding via `hermes gateway setup`
 - ✅ Zero core code changes — pure plugin architecture

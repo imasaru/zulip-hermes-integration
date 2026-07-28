@@ -13,6 +13,12 @@ class MessageType(Enum):
 class SendResult:
     success: bool
     message_id: str = ""
+    error: Optional[str] = None
+    raw_response: Any = None
+    retryable: bool = False
+    retry_after: Optional[float] = None
+    continuation_message_ids: tuple = ()
+    error_kind: Optional[str] = None
 
 
 @dataclass
@@ -22,6 +28,10 @@ class MessageSource:
     chat_type: str = ""
     user_id: str = ""
     user_name: str = ""
+    thread_id: Optional[str] = None
+    chat_topic: Optional[str] = None
+    message_id: Optional[str] = None
+    platform: Any = None
 
 
 @dataclass
@@ -42,7 +52,10 @@ class BasePlatformAdapter:
         self._connected = False
 
     def build_source(self, **kwargs):
-        return MessageSource(**kwargs)
+        # Ignore unknown kwargs so stub stays forward-compatible.
+        allowed = {f.name for f in MessageSource.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in kwargs.items() if k in allowed}
+        return MessageSource(**filtered)
 
     async def handle_message(self, event: MessageEvent):
         pass

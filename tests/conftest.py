@@ -75,6 +75,19 @@ class MockZulipClient:
     def update_message(self, request):
         return {"result": "success"}
 
+    def move_topic(
+        self,
+        stream,
+        new_stream,
+        topic,
+        new_topic=None,
+        message_id=None,
+        propagate_mode="change_all",
+        notify_old_topic=True,
+        notify_new_topic=True,
+    ):
+        return {"result": "success"}
+
     def update_message_flags(self, request):
         return {"result": "success"}
 
@@ -96,7 +109,12 @@ class MockZulipClient:
 @pytest.fixture(autouse=True)
 def clear_caches():
     """Clear client and target caches between tests to ensure isolation."""
-    from zulip.adapter import _clear_caches
+    try:
+        from zulip.adapter import _clear_caches
+    except ImportError:
+        # Cache helpers are optional depending on adapter revision.
+        yield
+        return
     _clear_caches()
     yield
 

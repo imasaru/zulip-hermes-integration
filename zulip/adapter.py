@@ -74,6 +74,9 @@ def _resolve_chatmode() -> tuple[str, list[str], bool]:
 class ZulipAdapter(BasePlatformAdapter):
     """Zulip platform adapter for Hermes Gateway."""
 
+    # Zulip message body soft limit used by send/edit paths.
+    MAX_MESSAGE_LENGTH = DEFAULT_CHUNK_LIMIT
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("zulip"))
         extra = config.extra or {}
@@ -83,8 +86,24 @@ class ZulipAdapter(BasePlatformAdapter):
         self.site = os.getenv("ZULIP_SITE") or extra.get("site", "")
         self.home_topic = (
             os.getenv("ZULIP_HOME_CHANNEL_NAME")
-            or extra.get("home_topic", "general")
+            or extra.get("home_topic")
+            or extra.get("home_channel_name")
+            or "general"
         )
+        # Numeric home stream id (cron / handoff default destination).
+        home_channel = (
+            os.getenv("ZULIP_HOME_CHANNEL")
+            or extra.get("home_channel")
+            or ""
+        )
+        if isinstance(home_channel, dict):
+            self.home_channel = str(
+                home_channel.get("chat_id") or home_channel.get("id") or ""
+            ).strip() or None
+            if home_channel.get("name"):
+                self.home_topic = str(home_channel.get("name"))
+        else:
+            self.home_channel = str(home_channel).strip() or None
 
         if not ZULIP_AVAILABLE:
             logger.error(
@@ -102,6 +121,8 @@ class ZulipAdapter(BasePlatformAdapter):
 
         # Track latest topic per stream so replies stay threaded
         self._topic_cache: dict[str, str] = {}
+        # stream_id -> stream name (required by Client.move_topic)
+        self._stream_names: dict[str, str] = {}
 
         self._data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
 
@@ -318,21 +339,33 @@ class ZulipAdapter(BasePlatformAdapter):
 
         if msg_type == "stream":
             stream_id = message.get("stream_id")
-            topic = message.get("subject", "")
-            stream_name = message.get("display_recipient", str(stream_id))
+            topic = message.get("subject") or message.get("topic") or ""
+            stream_name = message.get("display_recipient") or str(stream_id)
 
-            # Cache topic for reply threading
+            # Cache topic + stream name for reply threading and rename_topic.
             chat_id = str(stream_id)
             self._topic_cache[chat_id] = topic
+            if stream_id is not None and stream_name:
+                self._stream_names[chat_id] = str(stream_name)
 
+            # chat_type="thread" + thread_id=topic is what gateway expects for
+            # Zulip topic lanes (session keys, /title rename, handoffs).
             source = self.build_source(
                 chat_id=chat_id,
-                chat_name=stream_name,
-                chat_type="stream",
+                chat_name=str(stream_name),
+                chat_type="thread",
                 user_id=sender_email,
                 user_name=sender_full_name,
+                thread_id=topic or None,
+                chat_topic=topic or None,
+                message_id=str(message_id) if message_id is not None else None,
             )
-            extra_meta = {"topic": topic, "stream_id": stream_id}
+            extra_meta = {
+                "topic": topic,
+                "thread_id": topic,
+                "stream_id": stream_id,
+                "stream_name": str(stream_name),
+            }
         else:
             sender_id = message.get("sender_id")
             chat_id = f"dm:{sender_id}"
@@ -343,14 +376,46 @@ class ZulipAdapter(BasePlatformAdapter):
                 chat_type="dm",
                 user_id=sender_email,
                 user_name=sender_full_name,
+                message_id=str(message_id) if message_id is not None else None,
             )
             extra_meta = {"user_id": sender_id, "user_email": sender_email}
+
+        # Local admin commands (/help, /status, …) stay in-plugin.
+        # Unknown slash commands — including /stop — fall through so the
+        # gateway slash/interrupt layer can handle them.
+        try:
+            from .commands import handle_command
+
+            cmd_result = handle_command(
+                content,
+                chat_id=chat_id,
+                sender_email=sender_email,
+                sender_name=sender_full_name,
+            )
+            if cmd_result.handled:
+                await self.send(
+                    chat_id,
+                    cmd_result.reply or "",
+                    metadata=extra_meta,
+                )
+                await reactions.success()
+                if typing_params:
+                    typing_params["op"] = "stop"
+                    try:
+                        await asyncio.to_thread(
+                            self.client.set_typing_status, typing_params
+                        )
+                    except Exception:
+                        pass
+                return
+        except Exception as exc:
+            logger.debug("zulip local command handling failed: %s", exc)
 
         event = MessageEvent(
             text=content,
             message_type=MessageType.TEXT,
             source=source,
-            message_id=str(message_id),
+            message_id=str(message_id) if message_id is not None else None,
             metadata=extra_meta,
         )
 
@@ -437,37 +502,63 @@ class ZulipAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a single (unchunked) message."""
         try:
-            if chat_id.startswith("dm:"):
-                user_id = int(chat_id[3:])
-                result = await asyncio.to_thread(
-                    self.client.send_message,
-                    {
-                        "type": "private",
-                        "to": [user_id],
-                        "content": content,
-                        "reply_to": reply_to,
-                    },
+            chat_id_s = str(chat_id)
+            if chat_id_s.startswith("dm:") or chat_id_s.startswith("dm_user:"):
+                raw = (
+                    chat_id_s[3:]
+                    if chat_id_s.startswith("dm:")
+                    else chat_id_s[len("dm_user:") :]
                 )
+                try:
+                    to = [int(raw)]
+                except ValueError:
+                    to = [raw]
+                payload: dict[str, Any] = {
+                    "type": "private",
+                    "to": to,
+                    "content": content,
+                }
+                if reply_to is not None:
+                    payload["reply_to"] = reply_to
+                result = await asyncio.to_thread(self.client.send_message, payload)
             else:
-                stream_id = int(chat_id)
-                topic = topic_override or metadata.get("topic")
-                if not topic:
-                    topic = self._topic_cache.get(chat_id, self.home_topic)
-                # If still no topic, use the second part of chat_id
-                # (e.g. cron deliver "zulip:614901:inbox-digest" → topic="inbox-digest")
-                if not topic and len(parts) > 1:
-                    topic = parts[1]
+                # Support "stream_id:topic" (cron deliver / explicit routing).
+                stream_key = chat_id_s
+                embedded_topic = None
+                if ":" in chat_id_s and not chat_id_s.startswith("http"):
+                    left, right = chat_id_s.rsplit(":", 1)
+                    if left.isdigit() or left:
+                        stream_key = left
+                        embedded_topic = right or None
 
-                result = await asyncio.to_thread(
-                    self.client.send_message,
-                    {
-                        "type": "stream",
-                        "to": stream_id,
-                        "topic": topic,
-                        "content": content,
-                        "reply_to": reply_to,
-                    },
+                try:
+                    stream_to: Any = int(stream_key)
+                except (TypeError, ValueError):
+                    stream_to = stream_key
+
+                topic = (
+                    topic_override
+                    or metadata.get("topic")
+                    or metadata.get("thread_id")
+                    or metadata.get("subject")
+                    or embedded_topic
+                    or self._topic_cache.get(str(stream_key))
+                    or self.home_topic
+                    or "general"
                 )
+
+                payload = {
+                    "type": "stream",
+                    "to": stream_to,
+                    "topic": str(topic),
+                    "content": content,
+                }
+                if reply_to is not None:
+                    payload["reply_to"] = reply_to
+                result = await asyncio.to_thread(self.client.send_message, payload)
+
+                # Keep caches warm for later reply / rename.
+                self._topic_cache[str(stream_key)] = str(topic)
 
             if result.get("result") == "success":
                 logger.debug("zulip message sent to %s", chat_id)
@@ -482,7 +573,12 @@ class ZulipAdapter(BasePlatformAdapter):
                         error=mask_pii(str(result)),
                     )
                 )
-                return SendResult(success=False, message_id="")
+                return SendResult(
+                    success=False,
+                    message_id="",
+                    error=str(result.get("msg") or result),
+                    raw_response=result,
+                )
 
         except Exception as e:
             logger.error(
@@ -492,7 +588,202 @@ class ZulipAdapter(BasePlatformAdapter):
                     error=mask_pii(str(e)),
                 )
             )
-            return SendResult(success=False, message_id="")
+            return SendResult(success=False, message_id="", error=str(e), retryable=True)
+
+    # ------------------------------------------------------------------
+    # Gateway integration methods (ported from feature-rich adapter work)
+    # ------------------------------------------------------------------
+
+    def supports_draft_streaming(
+        self,
+        chat_type: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> bool:
+        """Zulip can stream via edit_message (send + progressive updates).
+
+        Core still defaults ``display.platforms.zulip.streaming`` to False
+        because progressive edits show EDITED tags and re-render Markdown.
+        Returning True here only enables the path when the user opts in.
+        """
+        # Explicit opt-out via the plugin's historical env flag.
+        if os.getenv("ZULIP_EDIT_PLACEHOLDER", "true").strip().lower() in (
+            "false",
+            "0",
+            "no",
+            "off",
+        ):
+            return False
+        return True
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Edit a previously sent Zulip message (streaming drafts / finalize).
+
+        ``finalize`` is unused on Zulip — an edit is an edit — but accepted
+        for BasePlatformAdapter compatibility.
+        """
+        if not content:
+            return SendResult(success=False, error="empty content")
+        if not message_id:
+            return SendResult(success=False, error="missing message_id")
+        if len(content) > self.MAX_MESSAGE_LENGTH:
+            content = content[: self.MAX_MESSAGE_LENGTH]
+        try:
+            msg_id = int(message_id)
+        except (TypeError, ValueError):
+            return SendResult(
+                success=False, error=f"invalid message_id: {message_id!r}"
+            )
+        try:
+            payload = {"message_id": msg_id, "content": content}
+            result = await asyncio.to_thread(self.client.update_message, payload)
+            if result.get("result") == "success":
+                logger.debug(
+                    "zulip edit_message ok id=%s len=%d finalize=%s",
+                    msg_id,
+                    len(content),
+                    finalize,
+                )
+                return SendResult(
+                    success=True,
+                    message_id=str(msg_id),
+                    raw_response=result,
+                )
+            err = result.get("msg") or str(result)
+            logger.warning("zulip edit_message failed: %s", err)
+            err_l = str(err).lower()
+            retryable = any(
+                tok in err_l
+                for tok in ("rate", "flood", "retry", "timeout", "temporarily")
+            )
+            return SendResult(
+                success=False,
+                error=err,
+                raw_response=result,
+                retryable=retryable,
+            )
+        except Exception as e:
+            logger.error("zulip edit_message error: %s", e)
+            return SendResult(success=False, error=str(e), retryable=True)
+
+    async def rename_topic(
+        self,
+        chat_id: str,
+        old_topic: str,
+        new_topic: str,
+    ):
+        """Rename a Zulip stream topic to match a Hermes session title.
+
+        Uses Client.move_topic(stream, new_stream, topic, new_topic=...) with
+        the same stream on both ends (in-place rename).
+
+        Returns ``(ok, detail)`` where *detail* is None on success, or a short
+        human-readable reason on failure / no-op.
+        """
+        if not old_topic or not new_topic:
+            return False, "missing topic name"
+        new_topic = str(new_topic).strip()[:60]
+        old_topic = str(old_topic).strip()
+        if not new_topic or new_topic == old_topic:
+            return False, "topic unchanged"
+        if str(chat_id).startswith("dm:") or str(chat_id).startswith("dm_user:"):
+            return False, "DMs have no renameable topic"
+
+        stream_key = str(chat_id)
+        if ":" in stream_key:
+            stream_key = stream_key.rsplit(":", 1)[0]
+
+        stream = self._stream_names.get(stream_key)
+        if not stream:
+            # Best-effort fallbacks: home stream name, or the raw id/name.
+            if stream_key == str(self.home_channel or ""):
+                stream = self.home_topic or stream_key
+            else:
+                stream = stream_key
+        try:
+            result = await asyncio.to_thread(
+                self.client.move_topic,
+                stream,
+                stream,
+                old_topic,
+                new_topic,
+            )
+            if isinstance(result, dict) and result.get("result") == "success":
+                logger.info(
+                    "zulip renamed topic %r -> %r on stream %s",
+                    old_topic,
+                    new_topic,
+                    stream,
+                )
+                # Keep topic cache coherent for the stream.
+                self._topic_cache[stream_key] = new_topic
+                return True, None
+            msg = ""
+            if isinstance(result, dict):
+                msg = str(result.get("msg") or result.get("code") or result)
+            else:
+                msg = str(result)
+            logger.warning("zulip rename_topic failed: %s", result)
+            return False, (msg.strip() or "Zulip rename failed")
+        except Exception as e:
+            logger.warning("zulip rename_topic error: %s", e)
+            return False, str(e) or "Zulip rename error"
+
+    async def create_handoff_thread(
+        self,
+        parent_chat_id: str,
+        name: str,
+    ) -> Optional[str]:
+        """Create a dedicated Zulip topic for a CLI/session handoff.
+
+        Returns the topic name on success (used as Hermes thread_id),
+        or None on failure.
+        """
+        if str(parent_chat_id).startswith("dm:") or str(parent_chat_id).startswith(
+            "dm_user:"
+        ):
+            return None
+
+        name = str(name).strip() or "Hermes handoff"
+        name = name[:60]
+        seed_content = f"🔄 Hermes session handoff — {name}"
+
+        stream_key = str(parent_chat_id)
+        if ":" in stream_key:
+            stream_key = stream_key.rsplit(":", 1)[0]
+        try:
+            stream_to: Any = int(stream_key)
+        except (TypeError, ValueError):
+            stream_to = stream_key
+
+        try:
+            payload = {
+                "type": "stream",
+                "to": stream_to,
+                "topic": name,
+                "content": seed_content,
+            }
+            result = await asyncio.to_thread(self.client.send_message, payload)
+            if result.get("result") == "success":
+                logger.info(
+                    "zulip handoff thread created: topic=%s in stream %s",
+                    name,
+                    parent_chat_id,
+                )
+                self._topic_cache[str(stream_key)] = name
+                return name
+            err = result.get("msg") or str(result)
+            logger.warning("zulip handoff thread creation failed: %s", err)
+            return None
+        except Exception as e:
+            logger.warning("zulip handoff thread creation error: %s", e)
+            return None
 
 
 def check_requirements() -> bool:
