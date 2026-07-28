@@ -19,6 +19,8 @@ A [Hermes Agent](https://hermes-agent.nousresearch.com) gateway plugin that adds
 >   - `create_handoff_thread` for CLI handoffs
 >   - topic-aware inbound routing (`chat_type=thread` + `thread_id`)
 >   - local `/help`/`/status`/`/model`; `/stop` falls through to Hermes gateway
+>   - sticky topic engagement (mention-to-start, free follow-ups with TTL + optional expiry notice)
+>   - reliable @mention detection via Zulip flags + bot display name
 >
 > **What we don't touch:** Everything else is upstream — the modular plugin architecture, SDK integration, event queue, and all other features.
 
@@ -31,6 +33,8 @@ A [Hermes Agent](https://hermes-agent.nousresearch.com) gateway plugin that adds
 - ✅ Opt-in progressive streaming via `edit_message` (`display.platforms.zulip.streaming`)
 - ✅ CLI handoff topics + gateway slash fallthrough (`/stop`)
 - ✅ Local admin commands (`/help`, `/status`, `/model`)
+- ✅ Sticky topic engagement — @mention once, then multi-turn without re-mention (TTL + `/unlisten`)
+- ✅ Expiry notice when sticky listening ends after idle quiet
 - ✅ User authorization via email allowlist
 - ✅ Interactive onboarding via `hermes gateway setup`
 - ✅ Zero core code changes — pure plugin architecture

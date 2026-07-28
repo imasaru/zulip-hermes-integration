@@ -28,20 +28,50 @@ from gateway.platforms.base import (
 )
 from gateway.config import Platform, PlatformConfig
 
-from zulip.logger import format_zulip_log, mask_pii
-from zulip.text_utils import (
-    chunk_text,
-    extract_topic_directive,
-    strip_onchar_prefix,
-    resolve_onchar_prefixes,
-    create_mention_regex,
-    normalize_mention,
-    strip_html_to_text,
-)
-from zulip.media import upload_file_to_zulip
-from zulip.queue_manager import ZulipQueueManager
-from zulip.dedupe_store import ZulipDedupeStore
-from zulip.reactions import ReactionConfig, ReactionLifecycle
+try:
+    from zulip.logger import format_zulip_log, mask_pii
+    from zulip.text_utils import (
+        chunk_text,
+        extract_topic_directive,
+        strip_onchar_prefix,
+        resolve_onchar_prefixes,
+        create_mention_regex,
+        normalize_mention,
+        strip_html_to_text,
+    )
+    from zulip.media import upload_file_to_zulip
+    from zulip.queue_manager import ZulipQueueManager
+    from zulip.dedupe_store import ZulipDedupeStore
+    from zulip.reactions import ReactionConfig, ReactionLifecycle
+    from zulip.engagement import (
+        TopicEngagementStore,
+        EngagementConfig,
+        is_stop_listening_message,
+        is_end_session_message,
+        format_expiry_notice_text,
+    )
+except ImportError:  # Hermes user-plugin layout (relative package)
+    from .logger import format_zulip_log, mask_pii
+    from .text_utils import (
+        chunk_text,
+        extract_topic_directive,
+        strip_onchar_prefix,
+        resolve_onchar_prefixes,
+        create_mention_regex,
+        normalize_mention,
+        strip_html_to_text,
+    )
+    from .media import upload_file_to_zulip
+    from .queue_manager import ZulipQueueManager
+    from .dedupe_store import ZulipDedupeStore
+    from .reactions import ReactionConfig, ReactionLifecycle
+    from .engagement import (
+        TopicEngagementStore,
+        EngagementConfig,
+        is_stop_listening_message,
+        is_end_session_message,
+        format_expiry_notice_text,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -119,10 +149,33 @@ class ZulipAdapter(BasePlatformAdapter):
             site=self.site,
         )
 
+        # Bot identity for mention matching (email local-part is NOT the display name)
+        self._bot_username = self.email.split("@")[0] if self.email else ""
+        self._bot_full_name = ""
+        try:
+            profile = self.client.get_profile()
+            if isinstance(profile, dict) and profile.get("result") == "success":
+                self._bot_full_name = (profile.get("full_name") or "").strip()
+            elif isinstance(profile, dict) and profile.get("full_name"):
+                self._bot_full_name = (profile.get("full_name") or "").strip()
+        except Exception:
+            pass
+
         # Track latest topic per stream so replies stay threaded
         self._topic_cache: dict[str, str] = {}
         # stream_id -> stream name (required by Client.move_topic)
         self._stream_names: dict[str, str] = {}
+
+        # Sticky topic engagement (mention-to-start, free follow-ups)
+        self._engagement = TopicEngagementStore(EngagementConfig.from_env())
+        logger.info(
+            "zulip engagement [mode=%s scope=%s ttl_min=%.0f expiry_notice=%s free_streams=%s]",
+            self._engagement.config.mode,
+            self._engagement.config.scope,
+            self._engagement.config.ttl_seconds / 60.0,
+            self._engagement.config.expiry_notice,
+            sorted(self._engagement.config.free_response_streams) or "none",
+        )
 
         self._data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
 
@@ -147,6 +200,7 @@ class ZulipAdapter(BasePlatformAdapter):
 
         self._listening = False
         self._event_task: Optional[asyncio.Task] = None
+        self._engagement_task: Optional[asyncio.Task] = None
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Initialize connection and start listening."""
@@ -171,6 +225,13 @@ class ZulipAdapter(BasePlatformAdapter):
 
         self._listening = True
         self._event_task = asyncio.create_task(self._listen_for_events())
+        if (
+            self._engagement.config.mode != "off"
+            and self._engagement.config.expiry_notice
+        ):
+            self._engagement_task = asyncio.create_task(
+                self._engagement_expiry_loop()
+            )
         self._mark_connected()
         return True
 
@@ -183,14 +244,88 @@ class ZulipAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Stop listening and close connection."""
         self._listening = False
-        if self._event_task:
-            self._event_task.cancel()
-            try:
-                await self._event_task
-            except asyncio.CancelledError:
-                pass
+        for task_attr in ("_event_task", "_engagement_task"):
+            task = getattr(self, task_attr, None)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                setattr(self, task_attr, None)
         self._mark_disconnected()
         logger.info("Zulip adapter disconnected")
+
+    async def _engagement_expiry_loop(self) -> None:
+        """Periodically expire sticky engagements and post topic notices.
+
+        Only natural idle TTL expiry notifies. /unlisten and /new clear silently.
+        Gateway shutdown does not spam leftover topics.
+        """
+        interval = self._engagement.config.expiry_scan_seconds
+        ttl_min = max(1, int(round(self._engagement.config.ttl_seconds / 60.0)))
+        bot_name = self._bot_full_name or ""
+        logger.info(
+            "zulip engagement expiry scanner started [interval=%.0fs ttl=%sm]",
+            interval,
+            ttl_min,
+        )
+        while self._listening:
+            try:
+                await asyncio.sleep(interval)
+                if not self._listening:
+                    break
+                expired = self._engagement.pop_expired()
+                if not expired:
+                    continue
+
+                # Coalesce: one notice per (stream_id, topic)
+                by_topic: dict[tuple[str, str], list] = {}
+                for entry in expired:
+                    key = (str(entry.stream_id), entry.topic or self.home_topic)
+                    by_topic.setdefault(key, []).append(entry)
+
+                for (stream_id, topic), entries in by_topic.items():
+                    text_out = format_expiry_notice_text(
+                        ttl_minutes=ttl_min,
+                        bot_display_name=bot_name,
+                        user_names=[e.user_name for e in entries if e.user_name],
+                    )
+                    try:
+                        result = await asyncio.to_thread(
+                            self.client.send_message,
+                            {
+                                "type": "stream",
+                                "to": int(stream_id),
+                                "topic": topic,
+                                "content": text_out,
+                            },
+                        )
+                        if result.get("result") == "success":
+                            logger.info(
+                                "zulip engagement expired notice [stream=%s topic=%s users=%d]",
+                                stream_id,
+                                topic,
+                                len(entries),
+                            )
+                        else:
+                            logger.warning(
+                                "zulip engagement expired notice failed [stream=%s topic=%s result=%s]",
+                                stream_id,
+                                topic,
+                                result,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "zulip engagement expired notice error [stream=%s topic=%s]: %s",
+                            stream_id,
+                            topic,
+                            e,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("zulip engagement expiry loop error: %s", e)
 
     async def _listen_for_events(self):
         """Listen for incoming Zulip messages via persistent event queue."""
@@ -232,6 +367,14 @@ class ZulipAdapter(BasePlatformAdapter):
                         batch_max_event_id = event_id
                     if event.get("type") == "message":
                         msg = event["message"]
+                        # Zulip puts mention flags on the EVENT, not the message body
+                        if "flags" in event and "flags" not in msg:
+                            msg = {**msg, "flags": event.get("flags") or []}
+                        elif "flags" in event:
+                            merged = list(dict.fromkeys(
+                                list(msg.get("flags") or []) + list(event.get("flags") or [])
+                            ))
+                            msg = {**msg, "flags": merged}
                         msg_id = str(msg.get("id", ""))
                         # Dedupe check
                         if self._dedupe.check(msg_id):
@@ -254,6 +397,47 @@ class ZulipAdapter(BasePlatformAdapter):
                 )
                 await asyncio.sleep(5)
 
+    def _message_mentions_bot(self, message: dict, plain_content: str) -> tuple[bool, Optional[re.Pattern]]:
+        """Detect @mentions of this bot.
+
+        Prefer Zulip's own ``flags`` (authoritative). Fall back to matching
+        the bot display name and email local-part in plain text — the display
+        name (e.g. ``Ai-agent (hermes)``) is what users actually @-mention,
+        not the email local-part.
+        """
+        flags = message.get("flags") or []
+        if "mentioned" in flags or "wildcard_mentioned" in flags:
+            return True, self._mention_strip_regex()
+
+        candidates: list[str] = []
+        if self._bot_full_name:
+            candidates.append(self._bot_full_name)
+        if self._bot_username:
+            candidates.append(self._bot_username)
+
+        for name in candidates:
+            # Avoid \b after ')' (display names like "Ai-agent (hermes)")
+            pattern = re.compile(
+                rf"@{re.escape(name)}(?=\s|[.,!?;:]|$)",
+                re.IGNORECASE,
+            )
+            if pattern.search(plain_content):
+                return True, pattern
+
+        if self._bot_username:
+            rx = create_mention_regex(self._bot_username)
+            if rx.search(plain_content):
+                return True, rx
+        return False, None
+
+    def _mention_strip_regex(self) -> Optional[re.Pattern]:
+        """Regex used to strip the bot mention from user text after a hit."""
+        names = [n for n in (self._bot_full_name, self._bot_username) if n]
+        if not names:
+            return None
+        alts = "|".join(re.escape(n) for n in names)
+        return re.compile(rf"@(?:{alts})(?=\s|[.,!?;:]|$)", re.IGNORECASE)
+
     async def _handle_message(self, message: dict):
         """Process incoming Zulip message."""
         # Filter self-messages to prevent loops
@@ -269,7 +453,99 @@ class ZulipAdapter(BasePlatformAdapter):
         # Strip Zulip @-mention syntax and HTML
         content = strip_html_to_text(content)
 
-        # --- Reactions ---
+        # --- Stream trigger gating (BEFORE reactions/typing) ---
+        mention_regex: Optional[re.Pattern] = None
+        stream_id_for_gate: Optional[Any] = None
+        topic_for_gate: str = ""
+        engaged_followup = False
+        free_response_hit = False
+
+        if msg_type == "stream":
+            stream_id_for_gate = message.get("stream_id")
+            topic_for_gate = message.get("subject") or message.get("topic") or ""
+            chatmode, onchar_prefixes, require_mention = _resolve_chatmode()
+
+            onchar_triggered, stripped = strip_onchar_prefix(content, onchar_prefixes)
+            if onchar_triggered:
+                content = stripped
+
+            was_mentioned, mention_regex = self._message_mentions_bot(message, content)
+
+            if stream_id_for_gate is not None and self._engagement.is_free_response_stream(
+                stream_id_for_gate
+            ):
+                free_response_hit = True
+
+            if (
+                not free_response_hit
+                and stream_id_for_gate is not None
+                and self._engagement.is_engaged(
+                    stream_id_for_gate, topic_for_gate, sender_email
+                )
+            ):
+                engaged_followup = True
+
+            should_process = False
+            if free_response_hit:
+                should_process = True
+            elif chatmode == "onmessage":
+                should_process = True
+            elif chatmode == "oncall":
+                should_process = was_mentioned or engaged_followup
+            elif chatmode == "onchar":
+                should_process = onchar_triggered or was_mentioned or engaged_followup
+
+            if (
+                chatmode != "onmessage"
+                and not free_response_hit
+                and not engaged_followup
+                and require_mention
+                and not was_mentioned
+                and not onchar_triggered
+            ):
+                should_process = False
+
+            if not should_process:
+                logger.info(
+                    "zulip drop [mode=%s mentioned=%s onchar=%s engaged=%s free=%s] msg=%s",
+                    chatmode,
+                    was_mentioned,
+                    onchar_triggered,
+                    engaged_followup,
+                    free_response_hit,
+                    message_id,
+                )
+                return
+
+            if was_mentioned:
+                content = normalize_mention(content, mention_regex)
+
+            # Explicit engagement stop ("stop listening" / /unlisten) — not bare /stop
+            if is_stop_listening_message(content):
+                cleared = self._engagement.clear(
+                    stream_id_for_gate, topic_for_gate, sender_email
+                )
+                await self._ack_engagement_stop(
+                    message, cleared=cleared, stream_id=stream_id_for_gate, topic=topic_for_gate
+                )
+                return
+
+            if was_mentioned or onchar_triggered or engaged_followup or free_response_hit:
+                self._engagement.mark_engaged(
+                    stream_id_for_gate,
+                    topic_for_gate,
+                    sender_email,
+                    user_name=sender_full_name,
+                )
+
+            # Bare /stop and /new clear engagement but still fall through to gateway
+            first_token = content.strip().split(maxsplit=1)[0].lower() if content.strip() else ""
+            if first_token in ("/stop", "/new", "/reset") or is_end_session_message(content):
+                self._engagement.clear(
+                    stream_id_for_gate, topic_for_gate, sender_email
+                )
+
+        # --- Reactions (only once we know we'll process) ---
         reactions = ReactionLifecycle(
             self.client, str(message_id), self._reaction_cfg
         )
@@ -302,41 +578,6 @@ class ZulipAdapter(BasePlatformAdapter):
             except Exception:
                 pass  # typing is best-effort
 
-        # --- Stream trigger gating ---
-        if msg_type == "stream":
-            chatmode, onchar_prefixes, require_mention = _resolve_chatmode()
-
-            # Check onchar trigger
-            onchar_triggered, stripped = strip_onchar_prefix(content, onchar_prefixes)
-            if onchar_triggered:
-                content = stripped
-
-            # Check mention (simple substring; bot username from email prefix)
-            bot_username = self.email.split("@")[0] if self.email else ""
-            mention_regex = create_mention_regex(bot_username) if bot_username else None
-            was_mentioned = bool(mention_regex and mention_regex.search(content))
-
-            # Apply gating
-            should_process = False
-            if chatmode == "onmessage":
-                should_process = True
-            elif chatmode == "oncall":
-                should_process = was_mentioned
-            elif chatmode == "onchar":
-                should_process = onchar_triggered or was_mentioned
-
-            # requireMention acts as additional gate (ignored in onmessage mode)
-            if chatmode != "onmessage" and require_mention and not was_mentioned and not onchar_triggered:
-                should_process = False
-
-            if not should_process:
-                logger.debug("zulip drop [mode=%s, no trigger] msg=%s", chatmode, message_id)
-                return
-
-            # Normalize mention from content
-            if was_mentioned and mention_regex:
-                content = normalize_mention(content, mention_regex)
-
         if msg_type == "stream":
             stream_id = message.get("stream_id")
             topic = message.get("subject") or message.get("topic") or ""
@@ -365,6 +606,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 "thread_id": topic,
                 "stream_id": stream_id,
                 "stream_name": str(stream_name),
+                "engaged_followup": engaged_followup,
             }
         else:
             sender_id = message.get("sender_id")
@@ -421,6 +663,11 @@ class ZulipAdapter(BasePlatformAdapter):
 
         try:
             await self.handle_message(event)
+            # Successful turn keeps sticky engagement warm
+            if msg_type == "stream" and stream_id_for_gate is not None:
+                self._engagement.touch(
+                    stream_id_for_gate, topic_for_gate, sender_email
+                )
             await reactions.success()
         except Exception:
             await reactions.error()
@@ -434,6 +681,49 @@ class ZulipAdapter(BasePlatformAdapter):
                     )
                 except Exception:
                     pass
+
+    async def _ack_engagement_stop(
+        self,
+        message: dict,
+        *,
+        cleared: bool,
+        stream_id: Any,
+        topic: str,
+    ) -> None:
+        """Send a short confirmation that sticky listening ended."""
+        msg_type = message.get("type")
+        if cleared:
+            text_out = (
+                "Okay — I'll stop listening on this topic. "
+                "@mention me again when you want to continue."
+            )
+        else:
+            text_out = (
+                "I wasn't actively listening on this topic. "
+                "@mention me to start a conversation."
+            )
+        try:
+            if msg_type == "private":
+                await asyncio.to_thread(
+                    self.client.send_message,
+                    {
+                        "type": "private",
+                        "to": [message.get("sender_id")],
+                        "content": text_out,
+                    },
+                )
+            else:
+                await asyncio.to_thread(
+                    self.client.send_message,
+                    {
+                        "type": "stream",
+                        "to": int(stream_id),
+                        "topic": topic or self.home_topic,
+                        "content": text_out,
+                    },
+                )
+        except Exception as e:
+            logger.warning("zulip engagement stop ack failed: %s", e)
 
     async def send(
         self,

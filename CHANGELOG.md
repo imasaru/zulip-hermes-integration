@@ -22,6 +22,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- **Sticky topic engagement**: after an @mention (or onchar trigger) on a stream topic, the same user can continue without re-mentioning until idle TTL expires (`ZULIP_ENGAGEMENT_MODE=sticky_topic`, default TTL 45m, scope `user`)
+- **Engagement expiry notices**: optional topic message when sticky listening idle-expires (`ZULIP_ENGAGEMENT_EXPIRY_NOTICE=true`); `/unlisten` / `stop listening` clear silently; bare `/stop` still falls through to Hermes gateway after clearing engagement
+- **Display-name mention detection**: use Zulip event `mentioned` flags + bot full name (e.g. `Ai-agent (hermes)`), not only email local-part — fixes oncall drops after 👀/typing
+- **Free-response streams**: `ZULIP_FREE_RESPONSE_STREAMS` allowlist of stream IDs that never require @mention
 - **Gateway streaming support**: `edit_message()` + `supports_draft_streaming()` so Hermes can progressive-edit replies when `display.platforms.zulip.streaming` is enabled (still off by default — EDITED-tag UX)
 - **Topic title sync**: `rename_topic()` via Zulip `move_topic`, used by gateway `/title` and auto-title for Zulip stream sessions
 - **Handoff topics**: `create_handoff_thread()` seeds a dedicated Zulip topic for CLI/session handoffs
