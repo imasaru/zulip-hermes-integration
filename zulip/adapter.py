@@ -165,6 +165,8 @@ class ZulipAdapter(BasePlatformAdapter):
         self._topic_cache: dict[str, str] = {}
         # stream_id -> stream name (required by Client.move_topic)
         self._stream_names: dict[str, str] = {}
+        # Zulip message id (int) -> Hermes session_id (str) for reply banners
+        self._zulip_to_session: dict[int, str] = {}
 
         # Sticky topic engagement (mention-to-start, free follow-ups)
         self._engagement = TopicEngagementStore(EngagementConfig.from_env())
@@ -453,6 +455,65 @@ class ZulipAdapter(BasePlatformAdapter):
         # Strip Zulip @-mention syntax and HTML
         content = strip_html_to_text(content)
 
+        # --- /reply command must be handled BEFORE chatmode gating ---
+        # so it works even when bot is in oncall mode and message has no @mention.
+        if content.strip().lower().startswith("/reply"):
+            reply_to_id = None
+            reply_args = content.strip()[6:].strip()
+            if reply_args.isdigit():
+                reply_to_id = int(reply_args)
+            else:
+                reply_to_id = message_id
+
+            # Build source/metadata early for banner
+            if msg_type == "stream":
+                stream_id_for_gate = message.get("stream_id")
+                topic_for_gate = message.get("subject") or message.get("topic") or ""
+                stream_name = message.get("display_recipient") or str(stream_id_for_gate)
+                chat_id = str(stream_id_for_gate)
+                extra_meta = {
+                    "topic": topic_for_gate,
+                    "thread_id": topic_for_gate,
+                    "stream_id": stream_id_for_gate,
+                    "stream_name": str(stream_name),
+                }
+            else:
+                sender_id = message.get("sender_id")
+                chat_id = f"dm:{sender_id}"
+                extra_meta = {"user_id": sender_id, "user_email": sender_email}
+
+            if reply_to_id:
+                # Show reactions for /reply
+                reactions = ReactionLifecycle(
+                    self.client, str(message_id), self._reaction_cfg
+                )
+                await reactions.start()
+
+                # Resolve session for current message without full AI turn
+                ev = MessageEvent(
+                    text=content,
+                    message_type=MessageType.TEXT,
+                    source=None,
+                    message_id=str(message_id) if message_id is not None else None,
+                    metadata=extra_meta,
+                    resolve_only=True,
+                )
+                try:
+                    await self.handle_message(ev)
+                    if message_id is not None and getattr(ev, "session_id", None):
+                        self._zulip_to_session[int(message_id)] = ev.session_id
+                except Exception:
+                    pass
+
+                banner = await self._build_reply_banner(chat_id, extra_meta, reply_to_id)
+                await self.send(
+                    chat_id,
+                    banner or "Could not build reply banner.",
+                    metadata=extra_meta,
+                )
+                await reactions.success()
+                return
+
         # --- Stream trigger gating (BEFORE reactions/typing) ---
         mention_regex: Optional[re.Pattern] = None
         stream_id_for_gate: Optional[Any] = None
@@ -663,6 +724,12 @@ class ZulipAdapter(BasePlatformAdapter):
 
         try:
             await self.handle_message(event)
+            # Record mapping so banners can show session ids instead of opaque Zulip ids
+            if message_id is not None and getattr(event, "session_id", None):
+                try:
+                    self._zulip_to_session[int(message_id)] = event.session_id
+                except Exception:
+                    pass
             # Successful turn keeps sticky engagement warm
             if msg_type == "stream" and stream_id_for_gate is not None:
                 self._engagement.touch(
@@ -725,6 +792,78 @@ class ZulipAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("zulip engagement stop ack failed: %s", e)
 
+    async def _build_reply_banner(self, chat_id, metadata, reply_to):
+        """Build a reply context banner using Hermes *session* ids when known.
+
+        Shows the target (if we have its session) and recent non-noisy messages
+        in the topic with their session ids (falling back to Zulip id).
+        Filters out gateway restart / status spam.
+        """
+        lines = []
+
+        topic = metadata.get("topic") or metadata.get("thread_id") or metadata.get("subject")
+        stream_id = metadata.get("stream_id")
+
+        # Noisy bot status patterns to suppress in the "recent" list
+        _NOISY_BOT_RE = re.compile(
+            r"(gateway (online|restarting|restart)|:recycle:|:warning:|hermes is back)",
+            re.I,
+        )
+
+        target_sid = self._zulip_to_session.get(int(reply_to)) if reply_to else None
+        if target_sid:
+            lines.append(f"📎 Replying in session `{target_sid}` (zulip #{reply_to})")
+        else:
+            lines.append(f"📎 Replying to zulip message #{reply_to} (session unknown)")
+
+        if not (stream_id and topic):
+            return "\n".join(lines)
+
+        try:
+            # Fetch a few more than we need so we can filter noise
+            recent = await asyncio.to_thread(
+                self.client.get_messages,
+                {
+                    "anchor": "newest",
+                    "num_before": 12,
+                    "num_after": 0,
+                    "stream_id": int(stream_id),
+                    "topic": topic,
+                },
+            )
+            if recent.get("result") == "success" and recent.get("messages"):
+                meaningful = []
+                for msg in recent["messages"]:
+                    zid = msg.get("id")
+                    sender = (msg.get("sender_full_name") or "?")[:28]
+                    preview = msg.get("content", "") or ""
+                    preview = re.sub(r"<[^>]+>", "", preview)
+                    preview = re.sub(r"\s+", " ", preview).strip()[:55]
+
+                    # Skip our own noisy status messages
+                    if msg.get("sender_email") == self.email:
+                        if _NOISY_BOT_RE.search(preview or "") or _NOISY_BOT_RE.search(msg.get("content", "")):
+                            continue
+
+                    sid = self._zulip_to_session.get(int(zid)) if zid else None
+                    if sid:
+                        label = f"`{sid}`"
+                    else:
+                        label = f"zulip#{zid}"
+
+                    meaningful.append(f"  • {label} — {sender}: {preview}...")
+
+                # Keep most recent meaningful first, up to 5
+                if meaningful:
+                    lines.append("Recent messages in this topic:")
+                    for line in meaningful[:5]:
+                        lines.append(line)
+        except Exception as e:
+            logger.debug("zulip failed to fetch recent messages for banner: %s", e)
+            lines.append("⚠️ Could not fetch recent messages")
+
+        return "\n".join(lines)
+
     async def send(
         self,
         chat_id: str,
@@ -757,6 +896,12 @@ class ZulipAdapter(BasePlatformAdapter):
                 content = f"{content}\n\n{file_links}"
             else:
                 content = file_links
+
+        # Add reply context banner with recent message IDs if replying to a message
+        if reply_to is not None:
+            banner = await self._build_reply_banner(chat_id, metadata, reply_to)
+            if banner:
+                content = f"{content}\n\n{banner}"
 
         # Extract inline topic directive if present
         content, topic_override = extract_topic_directive(content)
@@ -1131,19 +1276,32 @@ async def _standalone_send(
     if not (email and api_key and site):
         return {"error": "Zulip credentials missing in platform config"}
 
+    # Resolve chunking config (same as live adapter)
+    limit_raw = os.getenv("ZULIP_TEXT_CHUNK_LIMIT", "").strip()
+    limit = int(limit_raw) if limit_raw.isdigit() else 10000
+    mode = os.getenv("ZULIP_CHUNK_MODE", "length").strip()
+
+    # Split message into chunks if needed
+    chunks = chunk_text(message, limit=limit, mode=mode)
+    if not chunks:
+        chunks = [""]
+
     try:
         client = zulip.Client(email=email, api_key=api_key, site=site)
 
         if chat_id.startswith("dm:"):
             user_id = int(chat_id[3:])
-            result = await asyncio.to_thread(
-                client.send_message,
-                {
-                    "type": "private",
-                    "to": [user_id],
-                    "content": message,
-                },
-            )
+            last_result = None
+            for chunk in chunks:
+                result = await asyncio.to_thread(
+                    client.send_message,
+                    {
+                        "type": "private",
+                        "to": [user_id],
+                        "content": chunk,
+                    },
+                )
+                last_result = result
         else:
             topic = thread_id or home_topic
             # Parse chat_id as "stream_id:topic" if it contains a colon
@@ -1154,20 +1312,23 @@ async def _standalone_send(
                     topic = parts[1]
             else:
                 stream_id = int(chat_id)
-            result = await asyncio.to_thread(
-                client.send_message,
-                {
-                    "type": "stream",
-                    "to": stream_id,
-                    "topic": topic,
-                    "content": message,
-                },
-            )
+            last_result = None
+            for chunk in chunks:
+                result = await asyncio.to_thread(
+                    client.send_message,
+                    {
+                        "type": "stream",
+                        "to": stream_id,
+                        "topic": topic,
+                        "content": chunk,
+                    },
+                )
+                last_result = result
 
-        if result.get("result") == "success":
-            return {"success": True, "message_id": str(result.get("id", ""))}
+        if last_result.get("result") == "success":
+            return {"success": True, "message_id": str(last_result.get("id", ""))}
         else:
-            return {"error": f"Zulip send failed: {result}"}
+            return {"error": f"Zulip send failed: {last_result}"}
 
     except Exception as e:
         return {"error": f"Zulip standalone send error: {e}"}
