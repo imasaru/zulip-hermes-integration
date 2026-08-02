@@ -195,7 +195,7 @@ class ZulipAdapter(BasePlatformAdapter):
             account_id=self.email or "default",
             data_dir=self._data_dir,
             register_fn=lambda: self.client.register(
-                event_types=["message"], fetch_event_id=0
+                event_types=["message", "reaction"], fetch_event_id=0
             ),
         )
         self._dedupe = ZulipDedupeStore(
@@ -392,6 +392,9 @@ class ZulipAdapter(BasePlatformAdapter):
                             logger.debug("zulip dedupe hit [msg=%s]", msg_id)
                             continue
                         await self._handle_message(msg)
+
+                    elif event.get("type") == "reaction":
+                        await self._handle_reaction(event)
 
                 # Batch update event ID
                 if batch_max_event_id > queue.last_event_id:
@@ -856,6 +859,130 @@ class ZulipAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
 
+
+    async def _handle_reaction(self, event: dict):
+        """Handle emoji reactions as an alternative way to select context.
+
+        Users can react directly to a message with:
+          📌 (pushpin)  → permanent/sticky context for the topic
+          🔖 (bookmark) → temporary/one-off context for the next message
+
+        This complements /reply N and /reply N sticky.
+        """
+        try:
+            if event.get("op") != "add":
+                return
+
+            user = event.get("user") or {}
+            sender_email = user.get("email") or ""
+            if sender_email == self.email:
+                return
+
+            message_id = event.get("message_id")
+            emoji = (event.get("emoji_name") or "").lower().strip()
+
+            permanent = False
+            if emoji in ("pushpin", "pin"):
+                permanent = True
+            elif emoji in ("bookmark", "book"):
+                permanent = False
+            else:
+                return
+
+            if not message_id:
+                return
+            zid = int(message_id)
+
+            sid = self._zulip_to_session.get(zid)
+
+            # Fetch the reacted message to get stream/topic for ckey
+            topic = ""
+            stream_id = None
+            is_private = False
+            sender_id = None
+            try:
+                res = await asyncio.to_thread(
+                    self.client.get_messages,
+                    {
+                        "anchor": zid,
+                        "num_before": 0,
+                        "num_after": 0,
+                        "include_anchor": True,
+                    },
+                )
+                if res.get("result") == "success" and res.get("messages"):
+                    m = res["messages"][0]
+                    if m.get("type") == "private":
+                        is_private = True
+                        sender_id = m.get("sender_id")
+                    else:
+                        stream_id = m.get("stream_id")
+                        topic = m.get("subject") or m.get("topic") or ""
+            except Exception:
+                pass
+
+            # Build context key
+            if is_private:
+                ckey = f"dm:{sender_id}" if sender_id else f"dm:msg:{zid}"
+            elif stream_id is not None:
+                ckey = f"{stream_id}:{topic}"
+            else:
+                ckey = f"unknown:{zid}"
+
+            mode = "permanent" if permanent else "temporary (one-off)"
+
+            if sid:
+                if permanent:
+                    self._sticky_context[ckey] = sid
+                else:
+                    self._pending_context[ckey] = sid
+
+                # Ensure visual marker
+                try:
+                    marker = "pushpin" if permanent else "bookmark"
+                    await asyncio.to_thread(
+                        self.client.add_reaction,
+                        {"message_id": zid, "emoji_name": marker},
+                    )
+                except Exception:
+                    pass
+
+                # Short confirmation in the topic (best effort)
+                ack = f"📌 Context set to `{sid}` (permanent) via reaction." if permanent else                       f"🔖 Context set to `{sid}` (temporary/one-off) via reaction."
+                try:
+                    if not is_private and stream_id is not None:
+                        await asyncio.to_thread(
+                            self.client.send_message,
+                            {
+                                "type": "stream",
+                                "to": int(stream_id),
+                                "topic": topic or self.home_topic,
+                                "content": ack,
+                            },
+                        )
+                except Exception:
+                    pass
+            else:
+                # No cached session id — guide the user
+                try:
+                    hint = f"Got 📌/🔖 on message #{zid}. I don't have a Hermes session cached for it yet. Use `/reply` (or reply in the topic) to list sessions with numbers, then react or `/reply N`."
+                    if not is_private and stream_id is not None:
+                        await asyncio.to_thread(
+                            self.client.send_message,
+                            {
+                                "type": "stream",
+                                "to": int(stream_id),
+                                "topic": topic or self.home_topic,
+                                "content": hint,
+                            },
+                        )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.debug("zulip reaction context handler error: %s", e)
+
+
     async def _ack_engagement_stop(
         self,
         message: dict,
@@ -965,7 +1092,11 @@ class ZulipAdapter(BasePlatformAdapter):
                 # Store for quick numeric selection via /reply N
                 if candidates:
                     self._last_reply_list[chat_id] = candidates[:5]
-                    lines.append("Recent messages in this topic (use /reply N for temp or /reply N sticky for permanent):")
+                    # Cache sids for listed messages so direct emoji reactions can resolve them
+                    for c in candidates:
+                        if c.get("zulip_id") and c.get("session_id"):
+                            self._zulip_to_session[c["zulip_id"]] = c["session_id"]
+                    lines.append("Recent messages in this topic (use /reply N for temp or /reply N sticky, or react with 📌/🔖 directly on a message):")
                     for c in candidates[:5]:
                         label = f"`{c['session_id']}`" if c.get("session_id") else f"zulip#{c.get('zulip_id')}"
                         lines.append(f"  {c['index']}. {label} — {c['sender']}: {c['preview']}...")
