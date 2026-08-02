@@ -167,6 +167,9 @@ class ZulipAdapter(BasePlatformAdapter):
         self._stream_names: dict[str, str] = {}
         # Zulip message id (int) -> Hermes session_id (str) for reply banners
         self._zulip_to_session: dict[int, str] = {}
+        # chat_id -> last numbered list of recent messages shown in a /reply banner
+        # Used so user can do "/reply 3" to pick the 3rd item instead of typing a long id.
+        self._last_reply_list: dict[str, list[dict]] = {}
 
         # Sticky topic engagement (mention-to-start, free follow-ups)
         self._engagement = TopicEngagementStore(EngagementConfig.from_env())
@@ -460,8 +463,21 @@ class ZulipAdapter(BasePlatformAdapter):
         if content.strip().lower().startswith("/reply"):
             reply_to_id = None
             reply_args = content.strip()[6:].strip()
-            if reply_args.isdigit():
-                reply_to_id = int(reply_args)
+            if reply_args:
+                if reply_args.isdigit():
+                    n = int(reply_args)
+                    # Small number (1-9) → select by position from the last banner list
+                    if 1 <= n <= 9:
+                        last = self._last_reply_list.get(chat_id) or []
+                        if 1 <= n <= len(last):
+                            chosen = last[n-1]
+                            reply_to_id = chosen.get("zulip_id") or n
+                        else:
+                            reply_to_id = n  # treat as direct zulip id
+                    else:
+                        reply_to_id = n
+                else:
+                    reply_to_id = message_id
             else:
                 reply_to_id = message_id
 
@@ -832,7 +848,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 },
             )
             if recent.get("result") == "success" and recent.get("messages"):
-                meaningful = []
+                candidates = []
                 for msg in recent["messages"]:
                     zid = msg.get("id")
                     sender = (msg.get("sender_full_name") or "?")[:28]
@@ -846,18 +862,22 @@ class ZulipAdapter(BasePlatformAdapter):
                             continue
 
                     sid = self._zulip_to_session.get(int(zid)) if zid else None
-                    if sid:
-                        label = f"`{sid}`"
-                    else:
-                        label = f"zulip#{zid}"
+                    idx = len(candidates) + 1
+                    candidates.append({
+                        "index": idx,
+                        "zulip_id": int(zid) if zid else None,
+                        "session_id": sid,
+                        "sender": sender,
+                        "preview": preview,
+                    })
 
-                    meaningful.append(f"  • {label} — {sender}: {preview}...")
-
-                # Keep most recent meaningful first, up to 5
-                if meaningful:
-                    lines.append("Recent messages in this topic:")
-                    for line in meaningful[:5]:
-                        lines.append(line)
+                # Store for quick numeric selection via /reply N
+                if candidates:
+                    self._last_reply_list[chat_id] = candidates[:5]
+                    lines.append("Recent messages in this topic (use /reply N to target one):")
+                    for c in candidates[:5]:
+                        label = f"`{c['session_id']}`" if c.get("session_id") else f"zulip#{c.get('zulip_id')}"
+                        lines.append(f"  {c['index']}. {label} — {c['sender']}: {c['preview']}...")
         except Exception as e:
             logger.debug("zulip failed to fetch recent messages for banner: %s", e)
             lines.append("⚠️ Could not fetch recent messages")
