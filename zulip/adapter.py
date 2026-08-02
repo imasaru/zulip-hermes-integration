@@ -170,6 +170,12 @@ class ZulipAdapter(BasePlatformAdapter):
         # chat_id -> last numbered list of recent messages shown in a /reply banner
         # Used so user can do "/reply 3" to pick the 3rd item instead of typing a long id.
         self._last_reply_list: dict[str, list[dict]] = {}
+        # Per-topic (or per-chat for DMs) sticky/pending context session overrides.
+        # key = f"{chat_id}:{topic}" for streams, just chat_id for DMs.
+        # _sticky_context: permanent until changed.
+        # _pending_context: consumed on the next inbound message only (non-permanent).
+        self._sticky_context: dict[str, str] = {}
+        self._pending_context: dict[str, str] = {}
 
         # Sticky topic engagement (mention-to-start, free follow-ups)
         self._engagement = TopicEngagementStore(EngagementConfig.from_env())
@@ -462,18 +468,30 @@ class ZulipAdapter(BasePlatformAdapter):
         # so it works even when bot is in oncall mode and message has no @mention.
         if content.strip().lower().startswith("/reply"):
             reply_to_id = None
-            reply_args = content.strip()[6:].strip()
-            if reply_args:
-                if reply_args.isdigit():
-                    n = int(reply_args)
-                    # Small number (1-9) → select by position from the last banner list
+            reply_args = content.strip()[6:].strip().lower()
+            permanent = False
+            # Detect permanent/sticky mode in one command
+            for flag in ("sticky", "permanent", "set", "persist"):
+                if flag in reply_args:
+                    permanent = True
+                    reply_args = reply_args.replace(flag, "").strip()
+            if reply_args.endswith("!"):
+                permanent = True
+                reply_args = reply_args.rstrip("!").strip()
+
+            # Re-parse numeric part after stripping flags
+            num_str = reply_args.strip()
+            chosen = None
+            if num_str:
+                if num_str.isdigit():
+                    n = int(num_str)
                     if 1 <= n <= 9:
                         last = self._last_reply_list.get(chat_id) or []
                         if 1 <= n <= len(last):
                             chosen = last[n-1]
                             reply_to_id = chosen.get("zulip_id") or n
                         else:
-                            reply_to_id = n  # treat as direct zulip id
+                            reply_to_id = n
                     else:
                         reply_to_id = n
                 else:
@@ -505,26 +523,72 @@ class ZulipAdapter(BasePlatformAdapter):
                 )
                 await reactions.start()
 
-                # Resolve session for current message without full AI turn
-                ev = MessageEvent(
-                    text=content,
-                    message_type=MessageType.TEXT,
-                    source=None,
-                    message_id=str(message_id) if message_id is not None else None,
-                    metadata=extra_meta,
-                    resolve_only=True,
-                )
-                try:
-                    await self.handle_message(ev)
-                    if message_id is not None and getattr(ev, "session_id", None):
-                        self._zulip_to_session[int(message_id)] = ev.session_id
-                except Exception:
-                    pass
+                # Determine the target Zulip id and (if known) Hermes session id
+                target_zid = int(reply_to_id) if isinstance(reply_to_id, (int, str)) and str(reply_to_id).isdigit() else None
+                target_sid = None
+                if chosen and chosen.get("session_id"):
+                    target_sid = chosen.get("session_id")
+                elif target_zid is not None:
+                    target_sid = self._zulip_to_session.get(target_zid)
+                if not target_sid:
+                    # Resolve just enough to learn the current message's session if bare /reply
+                    ev = MessageEvent(
+                        text=content,
+                        message_type=MessageType.TEXT,
+                        source=None,
+                        message_id=str(message_id) if message_id is not None else None,
+                        metadata=extra_meta,
+                        resolve_only=True,
+                    )
+                    try:
+                        await self.handle_message(ev)
+                        if message_id is not None and getattr(ev, "session_id", None):
+                            self._zulip_to_session[int(message_id)] = ev.session_id
+                            if target_zid is None or target_zid == message_id:
+                                target_sid = ev.session_id
+                    except Exception:
+                        pass
 
+                # Compute per-topic key and apply permanent vs non-permanent context
+                ckey = None
+                t = topic_for_gate if "topic_for_gate" in locals() else (extra_meta.get("topic") or extra_meta.get("thread_id") or "")
+                if msg_type == "stream" and chat_id:
+                    ckey = f"{chat_id}:{t or ''}"
+                else:
+                    ckey = chat_id
+
+                mode_label = "permanent" if permanent else "temporary (one-off)"
+                if ckey and target_sid:
+                    if permanent:
+                        self._sticky_context[ckey] = target_sid
+                    else:
+                        self._pending_context[ckey] = target_sid
+
+                # Visual marker: add a context emoji reaction to the target message (if we have its Zulip id)
+                # This is an alternative / addition to the text banner. Try different emojis to see what feels best.
+                if target_zid:
+                    try:
+                        ctx_emoji = "pushpin" if permanent else "bookmark"   # 📌 vs 🔖
+                        await asyncio.to_thread(
+                            self.client.add_reaction,
+                            {"message_id": int(target_zid), "emoji_name": ctx_emoji},
+                        )
+                    except Exception:
+                        pass  # best effort
+
+                # Build informative output (banner + selection note)
                 banner = await self._build_reply_banner(chat_id, extra_meta, reply_to_id)
+                note = ""
+                if target_sid:
+                    if permanent:
+                        note = "\n\nContext set to `" + str(target_sid) + "` (permanent). Future messages in this topic will use this session until you change it."
+                    else:
+                        note = "\n\nContext set to `" + str(target_sid) + "` (temporary/one-off for your next message)."
+                content_to_send = (banner or "Selected.") + note
+
                 await self.send(
                     chat_id,
-                    banner or "Could not build reply banner.",
+                    content_to_send,
                     metadata=extra_meta,
                 )
                 await reactions.success()
@@ -730,6 +794,33 @@ class ZulipAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("zulip local command handling failed: %s", exc)
 
+        # --- Apply sticky or pending session context override ---
+        # This lets /reply (or future /context) permanently or temporarily switch
+        # which Hermes session the AI uses for this topic/chat.
+        try:
+            ckey = None
+            if msg_type == "stream":
+                t = topic_for_gate or (message.get("subject") or message.get("topic") or "")
+                ckey = f"{chat_id}:{t}" if chat_id else None
+            else:
+                ckey = chat_id
+            if ckey:
+                sid = None
+                if ckey in self._pending_context:
+                    sid = self._pending_context.pop(ckey, None)
+                    if sid:
+                        extra_meta = dict(extra_meta)
+                        extra_meta["gateway_session_id"] = sid
+                        extra_meta["_context_mode"] = "pending"
+                elif ckey in self._sticky_context:
+                    sid = self._sticky_context.get(ckey)
+                    if sid:
+                        extra_meta = dict(extra_meta)
+                        extra_meta["gateway_session_id"] = sid
+                        extra_meta["_context_mode"] = "sticky"
+        except Exception as _ctx_exc:
+            logger.debug("context override failed: %s", _ctx_exc)
+
         event = MessageEvent(
             text=content,
             message_type=MessageType.TEXT,
@@ -874,7 +965,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 # Store for quick numeric selection via /reply N
                 if candidates:
                     self._last_reply_list[chat_id] = candidates[:5]
-                    lines.append("Recent messages in this topic (use /reply N to target one):")
+                    lines.append("Recent messages in this topic (use /reply N for temp or /reply N sticky for permanent):")
                     for c in candidates[:5]:
                         label = f"`{c['session_id']}`" if c.get("session_id") else f"zulip#{c.get('zulip_id')}"
                         lines.append(f"  {c['index']}. {label} — {c['sender']}: {c['preview']}...")
