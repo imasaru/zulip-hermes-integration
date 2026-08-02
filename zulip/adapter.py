@@ -489,7 +489,13 @@ class ZulipAdapter(BasePlatformAdapter):
                 if num_str.isdigit():
                     n = int(num_str)
                     if 1 <= n <= 9:
-                        last = self._last_reply_list.get(chat_id) or []
+                        # Compute topic-scoped key (same logic as in _build_reply_banner)
+                        if msg_type == "stream":
+                            t = topic_for_gate or (extra_meta.get("topic") or "")
+                            list_key = f"{chat_id}:{t}" if chat_id else chat_id
+                        else:
+                            list_key = chat_id
+                        last = self._last_reply_list.get(list_key) or []
                         if 1 <= n <= len(last):
                             chosen = last[n-1]
                             reply_to_id = chosen.get("zulip_id") or n
@@ -1055,14 +1061,18 @@ class ZulipAdapter(BasePlatformAdapter):
 
         try:
             # Fetch a few more than we need so we can filter noise
+            # Use explicit narrow for reliable topic scoping (stream + topic)
+            narrow = [
+                {"operator": "stream", "operand": str(stream_id)},
+                {"operator": "topic", "operand": topic},
+            ]
             recent = await asyncio.to_thread(
                 self.client.get_messages,
                 {
                     "anchor": "newest",
                     "num_before": 12,
                     "num_after": 0,
-                    "stream_id": int(stream_id),
-                    "topic": topic,
+                    "narrow": narrow,
                 },
             )
             if recent.get("result") == "success" and recent.get("messages"):
@@ -1089,17 +1099,32 @@ class ZulipAdapter(BasePlatformAdapter):
                         "preview": preview,
                     })
 
-                # Store for quick numeric selection via /reply N
-                if candidates:
-                    self._last_reply_list[chat_id] = candidates[:5]
-                    # Cache sids for listed messages so direct emoji reactions can resolve them
-                    for c in candidates:
+                # Only keep entries that have a real Hermes session for this topic
+                # (user request: show sessions connected to the same topic, not raw recent messages)
+                sessioned = [c for c in candidates if c.get("session_id")]
+                for i, c in enumerate(sessioned, 1):
+                    c["index"] = i
+
+                # Use a topic-scoped key so different topics in the same stream don't collide
+                if stream_id and topic:
+                    list_key = f"{stream_id}:{topic}"
+                else:
+                    list_key = chat_id
+
+                # Store the filtered (session-only) list for /reply N selection
+                if sessioned:
+                    self._last_reply_list[list_key] = sessioned[:5]
+                    # Cache sids for listed messages (for direct emoji reactions too)
+                    for c in sessioned:
                         if c.get("zulip_id") and c.get("session_id"):
                             self._zulip_to_session[c["zulip_id"]] = c["session_id"]
-                    lines.append("Recent messages in this topic (use /reply N for temp or /reply N sticky, or react with 📌/🔖 directly on a message):")
-                    for c in candidates[:5]:
-                        label = f"`{c['session_id']}`" if c.get("session_id") else f"zulip#{c.get('zulip_id')}"
-                        lines.append(f"  {c['index']}. {label} — {c['sender']}: {c['preview']}...")
+                    lines.append("Recent sessions in this topic (use /reply N, or react with 📌 permanent / 🔖 temporary):")
+                    for c in sessioned[:5]:
+                        lines.append(f"  {c['index']}. `{c['session_id']}` — {c['sender']}: {c['preview']}...")
+                elif candidates:
+                    # We saw messages in the topic, but none had cached sessions yet
+                    lines.append("No prior sessions with cached context in this topic yet.")
+                    lines.append("(Chat normally or use /reply to create sessions, then they will appear here.)")
         except Exception as e:
             logger.debug("zulip failed to fetch recent messages for banner: %s", e)
             lines.append("⚠️ Could not fetch recent messages")
