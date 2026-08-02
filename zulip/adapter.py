@@ -177,6 +177,13 @@ class ZulipAdapter(BasePlatformAdapter):
         self._sticky_context: dict[str, str] = {}
         self._pending_context: dict[str, str] = {}
 
+        # Per-topic anchor (zulip message id) for the most recent message the user
+        # explicitly targeted with /reply or emoji reaction (including cron outputs
+        # and messages without a prior cached Hermes session).
+        # Keyed the same as ckey. Lets us thread the banner and future responses to
+        # that specific Zulip message so the user can "start from" a cron digest, report, etc.
+        self._topic_anchors: dict[str, int] = {}
+
         # Sticky topic engagement (mention-to-start, free follow-ups)
         self._engagement = TopicEngagementStore(EngagementConfig.from_env())
         logger.info(
@@ -573,6 +580,11 @@ class ZulipAdapter(BasePlatformAdapter):
                     else:
                         self._pending_context[ckey] = target_sid
 
+                # Always record the zulip message anchor so we can thread to cron outputs
+                # and other messages that don't yet have a Hermes session.
+                if ckey and target_zid:
+                    self._topic_anchors[ckey] = int(target_zid)
+
                 # Visual marker: add a context emoji reaction to the target message (if we have its Zulip id)
                 # This is an alternative / addition to the text banner. Try different emojis to see what feels best.
                 if target_zid:
@@ -593,11 +605,14 @@ class ZulipAdapter(BasePlatformAdapter):
                         note = "\n\nContext set to `" + str(target_sid) + "` (permanent). Future messages in this topic will use this session until you change it."
                     else:
                         note = "\n\nContext set to `" + str(target_sid) + "` (temporary/one-off for your next message)."
+                elif target_zid:
+                    note = "\n\nTargeting zulip message #" + str(target_zid) + " (no cached session yet). Banner is threaded under it; your next message here starts context from this point."
                 content_to_send = (banner or "Selected.") + note
 
                 await self.send(
                     chat_id,
                     content_to_send,
+                    reply_to=target_zid if target_zid else None,
                     metadata=extra_meta,
                 )
                 await reactions.success()
@@ -1099,32 +1114,43 @@ class ZulipAdapter(BasePlatformAdapter):
                         "preview": preview,
                     })
 
-                # Only keep entries that have a real Hermes session for this topic
-                # (user request: show sessions connected to the same topic, not raw recent messages)
-                sessioned = [c for c in candidates if c.get("session_id")]
-                for i, c in enumerate(sessioned, 1):
+                # Build a mixed list so the banner is always useful:
+                # - Prefer messages that already have a cached Hermes session.
+                # - Always include 1-2 recent "zulip#..." fallbacks (cron outputs, bot summaries,
+                #   fresh messages, etc.) so the user has selectable targets and can start a
+                #   new session/context from them.
+                with_session = [c for c in candidates if c.get("session_id")]
+                without = [c for c in candidates if not c.get("session_id")]
+
+                display = list(with_session)
+                if len(display) < 5:
+                    display += without[: (5 - len(display)) ]
+
+                for i, c in enumerate(display, 1):
                     c["index"] = i
 
-                # Use a topic-scoped key so different topics in the same stream don't collide
+                # Topic-scoped key (different topics in the same stream stay independent)
                 if stream_id and topic:
                     list_key = f"{stream_id}:{topic}"
                 else:
                     list_key = chat_id
 
-                # Store the filtered (session-only) list for /reply N selection
-                if sessioned:
-                    self._last_reply_list[list_key] = sessioned[:5]
-                    # Cache sids for listed messages (for direct emoji reactions too)
-                    for c in sessioned:
+                if display:
+                    self._last_reply_list[list_key] = display[:5]
+                    # Keep sid cache warm (useful for direct 📌/🔖 emoji reactions too)
+                    for c in display:
                         if c.get("zulip_id") and c.get("session_id"):
                             self._zulip_to_session[c["zulip_id"]] = c["session_id"]
-                    lines.append("Recent sessions in this topic (use /reply N, or react with 📌 permanent / 🔖 temporary):")
-                    for c in sessioned[:5]:
-                        lines.append(f"  {c['index']}. `{c['session_id']}` — {c['sender']}: {c['preview']}...")
-                elif candidates:
-                    # We saw messages in the topic, but none had cached sessions yet
-                    lines.append("No prior sessions with cached context in this topic yet.")
-                    lines.append("(Chat normally or use /reply to create sessions, then they will appear here.)")
+
+                    lines.append("Recent messages in this topic (use /reply N or react 📌/🔖):")
+                    for c in display[:5]:
+                        if c.get("session_id"):
+                            label = f"`{c['session_id']}`"
+                        else:
+                            label = f"zulip#{c.get('zulip_id')} (no session yet — start from here)"
+                        lines.append(f"  {c['index']}. {label} — {c['sender']}: {c['preview']}...")
+                else:
+                    lines.append("No recent messages to target in this topic yet.")
         except Exception as e:
             logger.debug("zulip failed to fetch recent messages for banner: %s", e)
             lines.append("⚠️ Could not fetch recent messages")
@@ -1142,6 +1168,17 @@ class ZulipAdapter(BasePlatformAdapter):
         """Send message to a Zulip stream or DM, with chunking, topic directives, and files."""
         metadata = metadata or {}
         media_files = media_files or []
+
+        # If the caller didn't specify reply_to, but the user previously used /reply
+        # or emoji to target a message in this topic (e.g. a cron output), thread to it.
+        if reply_to is None and chat_id:
+            try:
+                t = (metadata or {}).get("topic") or (metadata or {}).get("thread_id") or ""
+                ckey = f"{chat_id}:{t or ''}" if t else str(chat_id)
+                if ckey in self._topic_anchors:
+                    reply_to = self._topic_anchors.pop(ckey, None)
+            except Exception:
+                pass
 
         # Upload files first
         uploaded_urls = []
