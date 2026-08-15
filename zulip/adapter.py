@@ -1059,9 +1059,10 @@ class ZulipAdapter(BasePlatformAdapter):
         topic = metadata.get("topic") or metadata.get("thread_id") or metadata.get("subject")
         stream_id = metadata.get("stream_id")
 
-        # Noisy bot status patterns to suppress in the "recent" list
+        # Only filter truly spammy gateway status messages, not cron outputs
+        # or other bot messages that the user may want to target.
         _NOISY_BOT_RE = re.compile(
-            r"(gateway (online|restarting|restart)|:recycle:|:warning:|hermes is back)",
+            r"gateway (online|restarting|restart|reboot)|hermes is back",
             re.I,
         )
 
