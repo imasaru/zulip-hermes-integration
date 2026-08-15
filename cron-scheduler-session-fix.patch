@@ -1,0 +1,53 @@
+--- a/cron/scheduler.py
++++ b/cron/scheduler.py
+@@ -1443,7 +1443,7 @@ def _ensure_valid_session_id(session_id):
+     return session_id
+ 
+ 
+-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
++def _deliver_result(job: dict, content: str, adapters=None, loop=None, session_id=None) -> Optional[str]:
+     """
+     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
+ 
+@@ -1451,6 +1451,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+     When ``...
++
++    When ``session_id`` is provided (cron job session), the adapter caches
++    ``_zulip_to_session`` after a successful standalone send so that future
++    replies in the same topic thread back to the cron session.
+     """
+     if not adapters:
+         adapters = _get_adapters()
+@@ -2090,6 +2094,26 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+ 
+             # Cache session mapping for Zulip standalone sends so future replies
++            # in the same topic thread back to the cron session.
++            if session_id and platform_name.lower() == "zulip" and runtime_adapter is not None:
++                try:
++                    zulip_msg_id = result.get("id") or result.get("zulip_msg_id")
++                    if zulip_msg_id:
++                        adapter_cache = getattr(runtime_adapter, "_zulip_to_session", None)
++                        if adapter_cache is not None:
++                            adapter_cache[int(zulip_msg_id)] = session_id
++                            logger.debug(
++                                "Job '%s': cached _zulip_to_session[%s] = %s for cron session continuity",
++                                job["id"], zulip_msg_id, session_id,
++                            )
++                except Exception as e:
++                    logger.warning(
++                        "Job '%s': failed to cache _zulip_to_session mapping: %s",
++                        job["id"], e,
++                    )
++
+             _maybe_mirror_cron_delivery(
+                 job, platform_name, chat_id, mirror_text,
+@@ -3998,7 +4022,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+                     deliver_content = _format_delivery_content(job, content, adapters)
+                     delivery_error = _deliver_result(
+                         job, deliver_content, adapters=adapters, loop=loop,
+-                    )
++                        session_id=_cron_session_id,
+                     )
+                     if delivery_error:
+                         logger.error("Job '%s': delivery failed: %s", job["id"], delivery_error)
