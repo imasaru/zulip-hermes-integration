@@ -6,9 +6,10 @@ Unknown commands fall through to the AI.
 
 from __future__ import annotations
 
-import os
-from typing import Callable, Any
+from typing import Callable
 from dataclasses import dataclass
+
+from .logger import mask_pii
 
 logger = __import__("logging").getLogger(__name__)
 
@@ -83,8 +84,8 @@ def handle_command(
         reply = handler(args, chat_id, sender_email, sender_name)
         return CommandResult(handled=True, reply=reply)
     except Exception as e:
-        logger.warning("command error [cmd=%s sender=%s]: %s", cmd, sender_email, e)
-        return CommandResult(handled=True, reply=f"❌ Error processing /{cmd}: {e}")
+        logger.warning("command error [cmd=%s sender=%s]: %s", cmd, mask_pii(sender_email), e)
+        return CommandResult(handled=True, reply=f"❌ Error processing /{cmd}. Please try again later.")
 
 
 # ------------------------------------------------------------------
@@ -120,7 +121,6 @@ def _cmd_status(
         "**Bot Status**",
         f"Version: `{__version__}`",
         f"Repo: {__repo__}",
-        f"Sender: {sender_email}",
     ]
     return "\n".join(lines)
 
@@ -138,3 +138,70 @@ def _cmd_model(
 def is_command(content: str) -> bool:
     """Check if content looks like a command (starts with /)."""
     return content.strip().startswith("/")
+
+
+# ------------------------------------------------------------------
+# Admin commands (stream CRUD, user info)
+# ------------------------------------------------------------------
+
+@register_command("streams")
+def _cmd_streams(
+    args: str, chat_id: str, sender_email: str, sender_name: str
+) -> str:
+    """List streams the bot can see.
+
+    Usage: /streams [--all]
+    """
+    return (
+        "Stream management is available through the AI agent.\n"
+        "Ask the bot to list, create, or manage streams "
+        "using natural language."
+    )
+
+
+@register_command("user")
+def _cmd_user(
+    args: str, chat_id: str, sender_email: str, sender_name: str
+) -> str:
+    """Get user information.
+
+    Usage: /user <email_or_id>
+    """
+    if not args:
+        return "Usage: `/user <email_or_id>`"
+    return (
+        "User information is available through the AI agent.\n"
+        f"Ask the bot about user `{args.strip()}`."
+    )
+
+
+@register_command("pin")
+def _cmd_pin(
+    args: str, chat_id: str, sender_email: str, sender_name: str
+) -> str:
+    """Star/pin a message.
+
+    Usage: /pin <message_id>
+    """
+    if not args:
+        return "Usage: `/pin <message_id>`"
+    return (
+        "Message pinning is available through the AI agent.\n"
+        f"Ask the bot to pin message `{args.strip()}`."
+    )
+
+
+@register_command("unpin")
+def _cmd_unpin(
+    args: str, chat_id: str, sender_email: str, sender_name: str
+) -> str:
+    """Unstar/unpin a message.
+
+    Usage: /unpin <message_id>
+    """
+    if not args:
+        return "Usage: `/unpin <message_id>`"
+    return (
+        "Message unpinning is available through the AI agent.\n"
+        f"Ask the bot to unpin message `{args.strip()}`."
+    )

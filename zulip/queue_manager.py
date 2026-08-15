@@ -55,6 +55,10 @@ class ZulipQueueManager:
         self._register_fn = register_fn
         self._current_queue: Optional[QueueMetadata] = None
         self._registration_promise: Optional[asyncio.Future] = None
+        # Debounced save state
+        self._dirty = False
+        self._save_timer: Optional[asyncio.TimerHandle] = None
+        self._debounce_delay = 5.0  # seconds (increased from 2.0 for lower write frequency)
 
     def _persistence_path(self) -> Path:
         safe_id = "".join(c if c.isalnum() else "_" for c in self.account_id)
@@ -93,6 +97,11 @@ class ZulipQueueManager:
                 json.dump(metadata.to_dict(), f)
                 temp_path = f.name
             os.replace(temp_path, path)
+            # Restrict file permissions to owner-only (0600)
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
         except OSError as e:
             logger.error(
                 "zulip queue save failed [account=%s error=%s]",
@@ -177,9 +186,36 @@ class ZulipQueueManager:
             pass
 
     def update_last_event_id(self, event_id: int) -> None:
-        """Update the last seen event ID and save to disk."""
+        """Update the last seen event ID and schedule a debounced save."""
         if self._current_queue and event_id > self._current_queue.last_event_id:
             self._current_queue.last_event_id = event_id
+            self._dirty = True
+            self._schedule_save()
+
+    def _schedule_save(self) -> None:
+        """Debounce disk writes to avoid I/O on every event batch."""
+        if self._save_timer is not None:
+            self._save_timer.cancel()
+        loop = asyncio.get_event_loop()
+        self._save_timer = loop.call_later(
+            self._debounce_delay,
+            lambda: asyncio.ensure_future(self._flush_save()),
+        )
+
+    async def _flush_save(self) -> None:
+        """Flush pending save if dirty."""
+        self._save_timer = None
+        if self._dirty and self._current_queue:
+            self._dirty = False
+            self.save(self._current_queue)
+
+    async def flush(self) -> None:
+        """Flush any pending save immediately. Used during shutdown."""
+        if self._save_timer is not None:
+            self._save_timer.cancel()
+            self._save_timer = None
+        if self._dirty and self._current_queue:
+            self._dirty = False
             self.save(self._current_queue)
 
     def get_queue(self) -> Optional[QueueMetadata]:

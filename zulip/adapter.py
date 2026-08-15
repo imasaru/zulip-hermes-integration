@@ -6,11 +6,12 @@ Supports stream messages (with topics) and private messages.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Any, overload
 
 try:
     import zulip
@@ -80,6 +81,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_CHUNK_LIMIT = 10000  # Hermes registry max_message_length
 DEFAULT_CHUNK_MODE = "length"
 
+# Timeout defaults (seconds) — Issue #62
+DEFAULT_CONNECT_TIMEOUT = 30.0
+DEFAULT_READ_TIMEOUT = 60.0
+DEFAULT_SEND_TIMEOUT = 90.0
+
+# Typing indicator delay (seconds) — how long to keep typing visible after
+# the API confirms the message was sent, so the response is visible in the UI
+# before the typing indicator stops and the success reaction appears.
+DEFAULT_TYPING_DELAY = 2.0
+
 
 def _resolve_chunk_config() -> tuple[int, str]:
     """Read chunking config from environment."""
@@ -91,13 +102,181 @@ def _resolve_chunk_config() -> tuple[int, str]:
     return limit, mode
 
 
+def _resolve_timeouts() -> tuple[float, float, float]:
+    """Read timeout config from environment.
+
+    Returns (connect_timeout, read_timeout, send_timeout) in seconds.
+    """
+    def _parse(val: str, default: float) -> float:
+        try:
+            return float(val.strip())
+        except (ValueError, AttributeError):
+            return default
+
+    connect = _parse(os.getenv("ZULIP_CONNECT_TIMEOUT", ""), DEFAULT_CONNECT_TIMEOUT)
+    read = _parse(os.getenv("ZULIP_READ_TIMEOUT", ""), DEFAULT_READ_TIMEOUT)
+    send = _parse(os.getenv("ZULIP_SEND_TIMEOUT", ""), DEFAULT_SEND_TIMEOUT)
+    return connect, read, send
+
+
+def _resolve_typing_delay() -> float:
+    """Read typing indicator delay from environment.
+
+    After the message is accepted by the Zulip API, the typing indicator
+    stays active for this many seconds so the response has time to propagate
+    to all clients before the indicator stops and the success reaction fires.
+    """
+    try:
+        val = float(os.getenv("ZULIP_TYPING_DELAY_SECONDS", "").strip())
+        return max(0.0, val)
+    except (ValueError, AttributeError):
+        return DEFAULT_TYPING_DELAY
+
+
+def _resolve_streams_filter() -> set[str] | None:
+    """Read stream filtering config from environment.
+
+    Returns None if all streams are allowed (default), or a set of
+    lowercase stream names to monitor.
+    """
+    raw = os.getenv("ZULIP_STREAMS", "").strip()
+    if not raw or raw == "*":
+        return None
+    return {s.strip().lower() for s in raw.split(",") if s.strip()}
+
+
+def _resolve_response_prefix() -> str:
+    """Read outbound response prefix from environment."""
+    return os.getenv("ZULIP_RESPONSE_PREFIX", "")
+
+
+def _resolve_stream_overrides() -> dict[str, dict[str, Any]]:
+    """Read per-stream trigger overrides from the environment.
+
+    ``ZULIP_STREAM_OVERRIDES`` is a JSON object mapping stream name to a
+    settings object, overriding ``ZULIP_CHATMODE`` for that stream::
+
+        ZULIP_STREAM_OVERRIDES='{
+          "bot lab":       {"chatmode": "onmessage"},
+          "team: general": {"chatmode": "oncall"}
+        }'
+
+    Only ``chatmode`` is supported. ``requireMention`` is deliberately not
+    overridable: in the current gate it is inert in every mode.
+
+    JSON is used rather than delimited pairs because Zulip stream names may
+    legitimately contain both colons and commas.
+
+    Stream names and setting keys are both matched case-insensitively.
+    Unrecognised setting keys are warned about. Malformed configuration is
+    logged and ignored rather than raised.
+    """
+    raw = os.getenv("ZULIP_STREAM_OVERRIDES", "").strip()
+    if len(raw.encode("utf-8")) > _MAX_JSON_OVERRIDES_BYTES:
+        logger.warning(
+            "ZULIP_STREAM_OVERRIDES exceeds max size (%d > %d bytes); ignoring overrides",
+            len(raw.encode("utf-8")),
+            _MAX_JSON_OVERRIDES_BYTES,
+        )
+        return _remember({})
+    cached_raw, cached = _stream_overrides_cache
+    if raw == cached_raw:
+        return cached
+
+    def _remember(value: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        global _stream_overrides_cache
+        _stream_overrides_cache = (raw, value)
+        return value
+
+    if not raw:
+        return _remember({})
+
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        logger.warning("ZULIP_STREAM_OVERRIDES is not valid JSON; ignoring overrides")
+        return _remember({})
+
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "ZULIP_STREAM_OVERRIDES must be a JSON object mapping stream name "
+            "to a settings object; ignoring overrides"
+        )
+        return _remember({})
+
+    overrides: dict[str, dict[str, Any]] = {}
+    for name, settings in parsed.items():
+        if not isinstance(settings, dict):
+            logger.warning(
+                "ZULIP_STREAM_OVERRIDES[%r] must be an object, e.g. "
+                '{"chatmode": "onmessage"}; ignoring entry',
+                name,
+            )
+            continue
+
+        entry: dict[str, Any] = {}
+
+        # Setting keys are matched case-insensitively
+        normalised = {str(k).strip().lower(): v for k, v in settings.items()}
+
+        # Warn about unrecognised keys
+        unknown = sorted(
+            k for k in normalised
+            if k not in ("chatmode", "requiremention", "require_mention")
+        )
+        if unknown:
+            logger.warning(
+                "ZULIP_STREAM_OVERRIDES[%r]: ignoring unrecognised key(s) %s; "
+                "the only supported key is 'chatmode'",
+                name, ", ".join(unknown),
+            )
+
+        mode = normalised.get("chatmode")
+        if mode is not None:
+            mode = str(mode).strip().lower()
+            if mode in ("onmessage", "oncall", "onchar"):
+                entry["chatmode"] = mode
+            else:
+                logger.warning(
+                    "ZULIP_STREAM_OVERRIDES[%r].chatmode=%r is not one of "
+                    "onmessage/oncall/onchar; ignoring it",
+                    name, mode,
+                )
+
+        if entry:
+            overrides[str(name).strip().lower()] = entry
+
+    return _remember(overrides)
+
+
+@overload
 def _resolve_chatmode() -> tuple[str, list[str], bool]:
-    """Read stream trigger mode config from environment."""
+    ...
+
+
+@overload
+def _resolve_chatmode(stream_name: str) -> tuple[str, list[str], bool]:
+    ...
+
+
+def _resolve_chatmode(stream_name: Optional[str] = None) -> tuple[str, list[str], bool]:
+    """Read stream trigger mode config from environment.
+
+    When ``stream_name`` is supplied, a matching entry in
+    ``ZULIP_STREAM_OVERRIDES`` takes precedence over the global
+    ``ZULIP_CHATMODE`` for that stream only.
+    """
     mode = os.getenv("ZULIP_CHATMODE", "onmessage").strip().lower()
     if mode not in ("onmessage", "oncall", "onchar"):
         mode = "onmessage"
     prefixes = resolve_onchar_prefixes(os.getenv("ZULIP_ONCHAR_PREFIXES", ""))
     require_mention = os.getenv("ZULIP_REQUIRE_MENTION", "true").strip().lower() not in ("false", "0", "no", "off")
+
+    if stream_name:
+        override = _resolve_stream_overrides().get(stream_name.strip().lower())
+        if override:
+            mode = override.get("chatmode", mode)
+
     return mode, prefixes, require_mention
 
 
@@ -197,6 +376,31 @@ class ZulipAdapter(BasePlatformAdapter):
 
         self._data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
 
+        # Timeout configuration (Issue #62)
+        self._connect_timeout, self._read_timeout, self._send_timeout = _resolve_timeouts()
+
+        # Typing indicator delay (Issue #96)
+        self._typing_delay = _resolve_typing_delay()
+
+        # Stream filtering (Issue #65) — None means all streams
+        self._streams_filter = _resolve_streams_filter()
+
+        # Response prefix (Issue #65) — prepended to every outbound message
+        self._response_prefix = _resolve_response_prefix()
+
+        # Rate limiter (per-sender, sliding window)
+        self._rate_limiter = RateLimiter(
+            max_per_minute=int(
+                os.getenv("ZULIP_MAX_MESSAGES_PER_MINUTE", "60").strip()
+            ),
+        )
+
+        # Audit logger for security events
+        self._audit_logger = AuditLogger(
+            data_dir=self._data_dir,
+            account_id=self.email or "default",
+        )
+
         # Persistent queue and dedupe
         self._queue_mgr = ZulipQueueManager(
             account_id=self.email or "default",
@@ -220,6 +424,71 @@ class ZulipAdapter(BasePlatformAdapter):
         self._event_task: Optional[asyncio.Task] = None
         self._engagement_task: Optional[asyncio.Task] = None
 
+    async def _sdk_call(self, fn, *args, timeout: float, **kwargs):
+        """Wrap a synchronous SDK call in asyncio.to_thread + asyncio.wait_for.
+
+        Provides outer-timeout protection so the gateway event loop never
+        blocks indefinitely on a hung Zulip API request.
+        """
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(fn, *args, **kwargs),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "zulip SDK call timed out after %.1fs [fn=%s]",
+                timeout,
+                getattr(fn, "__name__", repr(fn)),
+            )
+            raise
+
+    @staticmethod
+    def _validate_message_id(message_id: Any) -> int:
+        """Validate and convert a message ID to int.
+
+        Raises ValueError if the message ID is not a valid positive integer
+        or exceeds the maximum safe value.
+        Prevents path traversal, injection, and overflow via malformed IDs.
+        """
+        if message_id is None:
+            raise ValueError("message_id is required")
+        try:
+            mid = int(str(message_id).strip())
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid message_id: {message_id}")
+        if mid <= 0:
+            raise ValueError(f"message_id must be positive: {message_id}")
+        if mid > 2**63 - 1:
+            raise ValueError(f"message_id exceeds maximum safe value: {message_id}")
+        return mid
+
+    async def _stop_typing(self, typing_params: Optional[dict]) -> None:
+        """Stop typing indicator if it was started. Safe to call multiple times."""
+        if typing_params is None:
+            return
+        params = dict(typing_params)
+        params["op"] = "stop"
+        try:
+            await self._sdk_call(
+                self.client.set_typing_status,
+                params,
+                timeout=self._send_timeout,
+            )
+        except Exception:
+            pass
+
+    async def _mark_read(self, message_id: Any) -> None:
+        """Mark a message as read. Best-effort."""
+        try:
+            await self._sdk_call(
+                self.client.update_message_flags,
+                {"messages": [message_id], "op": "add", "flag": "read"},
+                timeout=self._send_timeout,
+            )
+        except Exception:
+            pass
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Initialize connection and start listening."""
         logger.info("Zulip adapter connecting...")
@@ -240,6 +509,22 @@ class ZulipAdapter(BasePlatformAdapter):
 
         # Ensure queue is registered before starting listener
         await self._queue_mgr.ensure_queue()
+
+        # Recover interrupted messages from previous gateway instance
+        bot_user_id = str(probe_result.get("bot", {}).get("id", ""))
+        asyncio.create_task(
+            recover_interrupted_messages(
+                client=self.client,
+                bot_email=self.email,
+                bot_user_id=bot_user_id,
+                reaction_start=self._reaction_cfg.on_start,
+                reaction_success=self._reaction_cfg.on_success,
+                reaction_error=self._reaction_cfg.on_error,
+                handle_message=self._handle_message,
+                sdk_call=self._sdk_call,
+                send_timeout=self._send_timeout,
+            )
+        )
 
         self._listening = True
         self._event_task = asyncio.create_task(self._listen_for_events())
@@ -353,10 +638,11 @@ class ZulipAdapter(BasePlatformAdapter):
             try:
                 queue = await self._queue_mgr.ensure_queue()
 
-                events = await asyncio.to_thread(
+                events = await self._sdk_call(
                     self.client.get_events,
                     queue_id=queue.queue_id,
                     last_event_id=queue.last_event_id,
+                    timeout=self._read_timeout,
                 )
 
                 if events.get("result") == "error":
@@ -379,6 +665,7 @@ class ZulipAdapter(BasePlatformAdapter):
                     continue
 
                 batch_max_event_id = queue.last_event_id
+                processing_tasks = []
                 for event in events.get("events", []):
                     event_id = event["id"]
                     if event_id > batch_max_event_id:
@@ -396,9 +683,17 @@ class ZulipAdapter(BasePlatformAdapter):
                         msg_id = str(msg.get("id", ""))
                         # Dedupe check
                         if self._dedupe.check(msg_id):
-                            logger.debug("zulip dedupe hit [msg=%s]", msg_id)
+                            logger.debug("zulip dedupe hit [msg=%s]", mask_pii(msg_id))
                             continue
-                        await self._handle_message(msg)
+                        # Process messages concurrently so a slow model call
+                        # does not block the poll loop for unrelated messages.
+                        # Per-session serialization is handled by the gateway.
+                        task = asyncio.create_task(self._handle_message(msg))
+                        processing_tasks.append(task)
+
+                # Fire-and-forget: don't await processing tasks here so the
+                # poll loop keeps fetching events. Errors are logged inside
+                # _handle_message.
 
                     elif event.get("type") == "reaction":
                         await self._handle_reaction(event)
@@ -470,6 +765,20 @@ class ZulipAdapter(BasePlatformAdapter):
         message_id = message.get("id")
         sender_email = message.get("sender_email", "")
         sender_full_name = message.get("sender_full_name", "Unknown")
+
+        # --- Rate limiting (per-sender) ---
+        sender_key = sender_email or str(message.get("sender_id", ""))
+        if not self._rate_limiter.check(sender_key):
+            logger.warning(
+                "zulip rate limit hit [sender=%s msg=%s]",
+                mask_pii(sender_key),
+                mask_pii(str(message_id)),
+            )
+            await self._audit_logger.log_rate_limit_exceeded(
+                sender_id=sender_key,
+                limit=self._rate_limiter.config["max_per_minute"],
+            )
+            return
 
         # Strip Zulip @-mention syntax and HTML
         content = strip_html_to_text(content)
@@ -712,36 +1021,9 @@ class ZulipAdapter(BasePlatformAdapter):
 
         # --- Reactions (only once we know we'll process) ---
         reactions = ReactionLifecycle(
-            self.client, str(message_id), self._reaction_cfg
+            self.client, str(message_id), self._reaction_cfg,
+            timeout=self._send_timeout,
         )
-        await reactions.start()
-
-        # --- Typing indicator ---
-        typing_params = None
-        if msg_type == "private":
-            typing_params = {
-                "op": "start",
-                "type": "direct",
-                "to": [message.get("sender_id")],
-            }
-        elif msg_type == "stream":
-            stream_id = message.get("stream_id")
-            topic = message.get("subject", "")
-            if stream_id:
-                typing_params = {
-                    "op": "start",
-                    "type": "stream",
-                    "stream_id": stream_id,
-                    "topic": topic,
-                }
-
-        if typing_params:
-            try:
-                await asyncio.to_thread(
-                    self.client.set_typing_status, typing_params
-                )
-            except Exception:
-                pass  # typing is best-effort
 
         if msg_type == "stream":
             stream_id = message.get("stream_id")
@@ -1186,13 +1468,20 @@ class ZulipAdapter(BasePlatformAdapter):
         if media_files:
             data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
             for file_path in media_files:
+                # Security: reject URL-like values in media_files (must be local paths)
+                if isinstance(file_path, str) and (file_path.startswith("http://") or file_path.startswith("https://")):
+                    logger.warning(
+                        "zulip send rejected URL in media_files [url=%s]",
+                        mask_pii(file_path),
+                    )
+                    continue
                 try:
                     url = await upload_file_to_zulip(
                         self.client, file_path, data_dir
                     )
                     uploaded_urls.append(url)
                 except Exception as e:
-                    logger.error("zulip upload failed [file=%s]: %s", file_path, e)
+                    logger.error("zulip upload failed [file=%s]: %s", mask_pii(file_path), e)
 
         # Append uploaded file links to content
         if uploaded_urls:
@@ -1227,7 +1516,7 @@ class ZulipAdapter(BasePlatformAdapter):
                     "zulip send failed on chunk %d/%d [chat=%s]",
                     idx + 1,
                     len(chunks),
-                    chat_id,
+                    mask_pii(chat_id),
                 )
 
         return last_result or SendResult(success=False, message_id="")

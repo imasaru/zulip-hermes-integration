@@ -4,7 +4,7 @@ This module is the single source of truth for the plugin version.
 When releasing, bump __version__ and create a matching Git tag.
 """
 
-__version__ = "1.6.0"
+__version__ = "1.8.0"
 __repo__ = "niyazmft/zulip-hermes-integration"
 __min_hermes__ = "0.18.2"
 
@@ -12,15 +12,20 @@ __min_hermes__ = "0.18.2"
 PLUGIN_FILES = [
     "__init__.py",
     "adapter.py",
+    "admin_actions.py",
+    "audit_logger.py",
     "commands.py",
     "dedupe_store.py",
+    "fallback_reader.py",
     "logger.py",
     "media.py",
     "plugin.yaml",
     "policy.py",
     "probe.py",
     "queue_manager.py",
+    "rate_limiter.py",
     "reactions.py",
+    "recovery.py",
     "text_utils.py",
     "updater.py",
     "version.py",

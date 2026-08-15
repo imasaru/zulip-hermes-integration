@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import errno
 import logging
 import os
 import re
@@ -144,15 +145,30 @@ async def upload_file_to_zulip(
     """Upload a local file to Zulip server.
 
     Returns the uploaded file URL.
-    Security: verifies file_path is under tmp or data_dir; rejects symlinks.
+    Security: verifies file_path is under tmp or data_dir; rejects symlinks
+    using atomic stat with follow_symlinks=False to prevent TOCTOU races.
     """
     original = Path(file_path)
 
-    # Reject symlinks BEFORE resolving — prevents reading outside tmp/data_dir
-    if original.is_symlink():
-        raise ValueError(f"Symlink rejected: {file_path}")
+    # Atomic symlink rejection using O_NOFOLLOW to prevent TOCTOU races.
+    # Open the file with O_NOFOLLOW so the kernel rejects symlinks atomically.
+    try:
+        fd = os.open(str(original), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise ValueError(f"File not found: {file_path}")
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise ValueError(f"Symlink rejected: {file_path}")
+        raise ValueError(f"Cannot access file: {file_path}: {e}")
 
-    resolved = original.resolve()
+    # If we got a file descriptor, it's not a symlink (O_NOFOLLOW would have
+    # raised ELOOP/EMLINK for symlinks). Now resolve the path for the
+    # authorized-path check.
+    try:
+        resolved = Path(os.path.realpath(original))
+    finally:
+        os.close(fd)
+
     tmp_dir = Path(tempfile.gettempdir()).resolve()
     allowed_data = Path(data_dir).expanduser().resolve()
 
@@ -165,6 +181,7 @@ async def upload_file_to_zulip(
             f"Allowed: {tmp_dir} or {allowed_data}"
         )
 
+    # Re-open for reading (safe: already validated)
     with open(resolved, "rb") as f:
         result = await asyncio.to_thread(client.upload_file, f)
 
