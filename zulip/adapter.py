@@ -1171,6 +1171,16 @@ class ZulipAdapter(BasePlatformAdapter):
           🔖 (bookmark) → temporary/one-off context for the next message
 
         This complements /reply N and /reply N sticky.
+
+        Key behaviors:
+        - Always sets _topic_anchors[ckey] = zid so future replies thread to
+          the reacted message (even when no session is cached yet).
+        - When a cached session exists, sets _sticky_context or _pending_context.
+        - When no cached session exists (e.g. cron output), still anchors the
+          topic so the user's next message will thread to the right message and
+          create a new session seeded from that message's content.
+        - Also tries to warm the session cache by fetching the reply banner,
+          which populates _zulip_to_session for messages visible in the topic.
         """
         try:
             if event.get("op") != "add":
@@ -1232,7 +1242,31 @@ class ZulipAdapter(BasePlatformAdapter):
             else:
                 ckey = f"unknown:{zid}"
 
-            mode = "permanent" if permanent else "temporary (one-off)"
+            # ----------------------------------------------------------------
+            # Always set the topic anchor so future replies thread to this
+            # message, regardless of whether we have a cached session.
+            # This is the primary fix for the "stale anchor" bug.
+            # ----------------------------------------------------------------
+            if ckey and not is_private:
+                self._topic_anchors[ckey] = zid
+
+            # ----------------------------------------------------------------
+            # Try to warm the session cache by fetching the reply banner.
+            # This populates _zulip_to_session for messages visible in the
+            # topic, including cron outputs that were not cached on delivery.
+            # ----------------------------------------------------------------
+            if not sid and stream_id and topic:
+                try:
+                    banner = await self._build_reply_banner(
+                        str(stream_id),
+                        {"topic": topic, "stream_id": stream_id},
+                        zid,
+                    )
+                    # _build_reply_banner populates _zulip_to_session for
+                    # all messages in the banner. Re-check after the call.
+                    sid = self._zulip_to_session.get(zid)
+                except Exception:
+                    pass  # best effort — proceed without banner
 
             if sid:
                 if permanent:
@@ -1251,7 +1285,11 @@ class ZulipAdapter(BasePlatformAdapter):
                     pass
 
                 # Short confirmation in the topic (best effort)
-                ack = f"📌 Context set to `{sid}` (permanent) via reaction." if permanent else                       f"🔖 Context set to `{sid}` (temporary/one-off) via reaction."
+                ack = (
+                    f"📌 Context set to `{sid}` (permanent) via reaction."
+                    if permanent
+                    else f"🔖 Context set to `{sid}` (temporary/one-off) via reaction."
+                )
                 try:
                     if not is_private and stream_id is not None:
                         await asyncio.to_thread(
@@ -1266,9 +1304,15 @@ class ZulipAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             else:
-                # No cached session id — guide the user
+                # No cached session id — set anchor and guide the user.
+                # The anchor is already set above; this just notifies the user
+                # that their next message will create a new session from this
+                # message's content.
                 try:
-                    hint = f"Got 📌/🔖 on message #{zid}. I don't have a Hermes session cached for it yet. Use `/reply` (or reply in the topic) to list sessions with numbers, then react or `/reply N`."
+                    hint = (
+                        f"Got 📌/🔖 on message #{zid}. No session cached for it yet — your next message in this topic will start a new session from this message. "
+                        f"Use `/reply` to see numbered sessions with cached context, then react or `/reply N`."
+                    )
                     if not is_private and stream_id is not None:
                         await asyncio.to_thread(
                             self.client.send_message,
