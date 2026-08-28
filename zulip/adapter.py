@@ -1067,6 +1067,14 @@ class ZulipAdapter(BasePlatformAdapter):
             runtime_scope.get_setting("ZULIP_BLOCK_STREAMING", "").strip().lower() in ("true", "1", "yes", "on")
         )
 
+        # Soft gate: when True, always dispatch stream messages to the LLM
+        # (like onmessage) but pass `addressed=False` in metadata for
+        # non-mentioned messages so the model can decide relevance.
+        # Matches LINE_SOFT_GATE behavior.
+        self._soft_gate = (
+            os.getenv("ZULIP_SOFT_GATE", "").strip().lower() in ("true", "1", "yes", "on")
+        )
+
         self._data_dir = runtime_scope.get_profile_data_dir()
 
         # Persisted sender display names (issue #152). Zulip events do not
@@ -2728,10 +2736,13 @@ class ZulipAdapter(BasePlatformAdapter):
                 should_process = True
             elif chatmode == "onmessage":
                 should_process = True
+                addressed = True
             elif chatmode == "oncall":
                 should_process = was_mentioned
+                addressed = was_mentioned
             elif chatmode == "onchar":
                 should_process = onchar_triggered or was_mentioned
+                addressed = onchar_triggered or was_mentioned
 
             # requireMention acts as additional gate (ignored in onmessage mode
             # and under the soft gate, which exists to dispatch everything).
@@ -3017,14 +3028,21 @@ class ZulipAdapter(BasePlatformAdapter):
             chat_id = str(stream_id)
             self._topic_cache[chat_id] = topic
 
+            # Use chat_type="thread" + thread_id when ZULIP_TOPIC_SESSIONS is enabled.
+            # This ensures build_session_key() puts "thread" in the chat_type slot and
+            # _parse_session_key() (and similar) will extract the topic as thread_id.
+            # Using "stream" would cause the topic suffix to be ignored by parsers
+            # that only look for thread_id on chat_type in {"dm", "thread"}, leading
+            # to messages routing to the wrong (non-per-topic) Hermes session.
+            use_thread = bool(topic and _topic_sessions_enabled())
             source_kwargs: dict[str, Any] = {
                 "chat_id": chat_id,
                 "chat_name": stream_name,
-                "chat_type": "stream",
+                "chat_type": "thread" if use_thread else "stream",
                 "user_id": sender_email,
                 "user_name": sender_full_name,
             }
-            if topic and _topic_sessions_enabled():
+            if use_thread:
                 source_kwargs["thread_id"] = topic
             source = self.build_source(**source_kwargs)
             extra_meta = {"topic": topic, "stream_id": stream_id}
@@ -3065,6 +3083,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 "user_id": sender_id,
                 "user_email": sender_email,
                 "recipient_ids": _private_recipient_ids(message),
+                "addressed": True,
             }
 
         # --- Context-mitigation metadata ---
