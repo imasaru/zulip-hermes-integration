@@ -71,6 +71,7 @@ class TestTopicScoping:
         await adapter._handle_message(self._stream_msg("deploys"))
         source = adapter.handle_message.call_args[0][0].source
         assert not getattr(source, "thread_id", "")
+        assert getattr(source, "chat_type", "") == "stream"
 
     @pytest.mark.asyncio
     async def test_topic_scopes_session_when_enabled(self, adapter, monkeypatch):
@@ -79,6 +80,7 @@ class TestTopicScoping:
         await adapter._handle_message(self._stream_msg("deploys"))
         source = adapter.handle_message.call_args[0][0].source
         assert source.thread_id == "deploys"
+        assert getattr(source, "chat_type", "") == "thread"
 
     @pytest.mark.asyncio
     async def test_different_topics_get_different_thread_ids(self, adapter, monkeypatch):
@@ -100,6 +102,7 @@ class TestTopicScoping:
         await adapter._handle_message(self._stream_msg(""))
         source = adapter.handle_message.call_args[0][0].source
         assert not getattr(source, "thread_id", "")
+        assert getattr(source, "chat_type", "") == "stream"
 
     @pytest.mark.asyncio
     async def test_dms_are_unaffected(self, adapter, monkeypatch):
