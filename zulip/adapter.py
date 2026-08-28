@@ -1056,6 +1056,8 @@ class ZulipAdapter(BasePlatformAdapter):
         self._last_topic_cache: dict[str, str] = {}      # stream_id → previous topic
         self._message_counts: dict[str, int] = {}        # chat_id → message count
         self._last_message_time: dict[str, float] = {}   # chat_id → last message epoch
+        # stream chat_id → anchoring topic name for per-topic session key (defensive for renames)
+        self._session_topics: dict[str, str] = {}
         # DM session rotation: prevents context bloat in long conversations
         self._dm_session_turn_limit = int(
             runtime_scope.get_setting("ZULIP_DM_SESSION_TURN_LIMIT", "20").strip()
@@ -3021,11 +3023,11 @@ class ZulipAdapter(BasePlatformAdapter):
 
         if msg_type == "stream":
             stream_id = message.get("stream_id")
-            topic = message.get("subject", "")
-            stream_name = message.get("display_recipient", str(stream_id))
+            topic = (message.get("subject") or "").strip()
+            stream_name = message.get("display_recipient", str(stream_id) if stream_id is not None else "unknown")
 
             # Cache topic for reply threading
-            chat_id = str(stream_id)
+            chat_id = str(stream_id) if stream_id is not None else ""
             self._topic_cache[chat_id] = topic
 
             # Use chat_type="thread" + thread_id when ZULIP_TOPIC_SESSIONS is enabled.
