@@ -80,3 +80,6 @@ optional_env:
   - name: ZULIP_STREAM_OVERRIDES
     description: 'Per-stream chatmode overrides as a JSON object, e.g. {"bot lab": {"chatmode": "onmessage"}}'
     prompt: "Per-stream chatmode overrides (JSON)"
+  - name: ZULIP_SOFT_GATE
+    description: 'Soft gate: dispatch all stream messages (like onmessage) but set addressed=False in metadata for messages that do not explicitly mention the bot (LLM decides relevance). Default: false (hard gate).'
+    prompt: "Enable ZULIP soft gate mode"

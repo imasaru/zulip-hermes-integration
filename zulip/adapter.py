@@ -529,6 +529,14 @@ class ZulipAdapter(BasePlatformAdapter):
             os.getenv("ZULIP_BLOCK_STREAMING", "").strip().lower() in ("true", "1", "yes", "on")
         )
 
+        # Soft gate: when True, always dispatch stream messages to the LLM
+        # (like onmessage) but pass `addressed=False` in metadata for
+        # non-mentioned messages so the model can decide relevance.
+        # Matches LINE_SOFT_GATE behavior.
+        self._soft_gate = (
+            os.getenv("ZULIP_SOFT_GATE", "").strip().lower() in ("true", "1", "yes", "on")
+        )
+
         self._data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
 
         # Timeout configuration (Issue #62)
@@ -970,16 +978,27 @@ class ZulipAdapter(BasePlatformAdapter):
                 was_mentioned = bool(mention_regex.search(content))
 
             # Apply gating
+            # Soft gate (ZULIP_SOFT_GATE): dispatch *all* streams (like onmessage)
+            # but tag metadata["addressed"] based on explicit mention.
+            # Non-mentioned get addressed=False so LLM can ignore irrelevant chatter.
+            # When disabled: original hard-gate behavior per chatmode.
             should_process = False
-            if chatmode == "onmessage":
+            addressed = False
+            if getattr(self, "_soft_gate", False):
                 should_process = True
+                addressed = was_mentioned or onchar_triggered
+            elif chatmode == "onmessage":
+                should_process = True
+                addressed = True
             elif chatmode == "oncall":
                 should_process = was_mentioned
+                addressed = was_mentioned
             elif chatmode == "onchar":
                 should_process = onchar_triggered or was_mentioned
+                addressed = onchar_triggered or was_mentioned
 
-            # requireMention acts as additional gate (ignored in onmessage mode)
-            if chatmode != "onmessage" and require_mention and not was_mentioned and not onchar_triggered:
+            # requireMention acts as additional gate (ignored in onmessage mode and soft gate)
+            if not getattr(self, "_soft_gate", False) and chatmode != "onmessage" and require_mention and not was_mentioned and not onchar_triggered:
                 should_process = False
 
             if not should_process:
@@ -1191,17 +1210,24 @@ class ZulipAdapter(BasePlatformAdapter):
             chat_id = str(stream_id)
             self._topic_cache[chat_id] = topic
 
+            # Use chat_type="thread" + thread_id when ZULIP_TOPIC_SESSIONS is enabled.
+            # This ensures build_session_key() puts "thread" in the chat_type slot and
+            # _parse_session_key() (and similar) will extract the topic as thread_id.
+            # Using "stream" would cause the topic suffix to be ignored by parsers
+            # that only look for thread_id on chat_type in {"dm", "thread"}, leading
+            # to messages routing to the wrong (non-per-topic) Hermes session.
+            use_thread = bool(topic and _topic_sessions_enabled())
             source_kwargs: dict[str, Any] = {
                 "chat_id": chat_id,
                 "chat_name": stream_name,
-                "chat_type": "stream",
+                "chat_type": "thread" if use_thread else "stream",
                 "user_id": sender_email,
                 "user_name": sender_full_name,
             }
-            if topic and _topic_sessions_enabled():
+            if use_thread:
                 source_kwargs["thread_id"] = topic
             source = self.build_source(**source_kwargs)
-            extra_meta = {"topic": topic, "stream_id": stream_id}
+            extra_meta = {"topic": topic, "stream_id": stream_id, "addressed": addressed}
         else:
             sender_id = message.get("sender_id")
             chat_id = f"dm:{sender_id}"
@@ -1223,7 +1249,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 user_id=sender_email,
                 user_name=sender_full_name,
             )
-            extra_meta = {"user_id": sender_id, "user_email": sender_email}
+            extra_meta = {"user_id": sender_id, "user_email": sender_email, "addressed": True}
 
         # --- Context-mitigation metadata ---
         now = time.time()

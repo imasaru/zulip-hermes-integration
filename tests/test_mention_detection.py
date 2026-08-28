@@ -324,3 +324,92 @@ class TestOtherDropPathsAreSilent:
         await adapter._handle_message(self._msg())
         adapter.handle_message.assert_not_called()
         assert self._typing_calls(adapter) == []
+
+class TestSoftGate:
+    def _msg(self, content="hello world", flags=None):
+        if flags is None:
+            flags = []
+        return {
+            "id": 1, "type": "stream", "stream_id": 30, "subject": "t",
+            "display_recipient": "general", "content": content,
+            "sender_email": "u@z.com", "sender_full_name": "U", "sender_id": 42,
+            "flags": flags,
+        }
+    """Minimal tests for ZULIP_SOFT_GATE per kanban task."""
+
+    @pytest.fixture
+    def adapter(self, mock_platform_config, monkeypatch):
+        import zulip.adapter as adapter_module
+        monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
+
+        class MockZulipModule:
+            class Client:
+                def __init__(self, email=None, api_key=None, site=None):
+                    pass
+
+                def set_typing_status(self, *a, **k):
+                    pass
+
+                def add_reaction(self, *a, **k):
+                    pass
+
+                def remove_reaction(self, *a, **k):
+                    pass
+
+                def update_message_flags(self, *a, **k):
+                    pass
+
+                def send_message(self, *a, **k):
+                    pass
+
+        monkeypatch.setattr(adapter_module, "zulip", MockZulipModule())
+        from zulip.adapter import ZulipAdapter
+        a = ZulipAdapter(mock_platform_config)
+        a.email = "soju-bot@zulip.com"
+        a.bot_full_name = "Soju"
+        a.handle_message = AsyncMock()
+        a._sdk_call = AsyncMock(return_value={"result": "success", "id": 1})
+        return a
+
+    def _msg(self, content="hello world", flags=None):
+        if flags is None:
+            flags = []
+        return {
+            "id": 1, "type": "stream", "stream_id": 30, "subject": "t",
+            "display_recipient": "general", "content": content,
+            "sender_email": "u@z.com", "sender_full_name": "U", "sender_id": 42,
+            "flags": flags,
+        }
+
+    @pytest.mark.asyncio
+    async def test_soft_gate_dispatches_non_mentioned(self, adapter, monkeypatch):
+        """Soft gate: non-mentioned stream msg is dispatched (addressed=False)."""
+        monkeypatch.setenv("ZULIP_SOFT_GATE", "true")
+        monkeypatch.setenv("ZULIP_CHATMODE", "oncall")  # would normally gate
+        msg = self._msg(content="just chatting, no mention")
+        await adapter._handle_message(msg)
+        adapter.handle_message.assert_called_once()
+        # Check metadata had addressed=False
+        call_args = adapter.handle_message.call_args[0][0]
+        assert call_args.metadata.get("addressed") is False
+
+    @pytest.mark.asyncio
+    async def test_soft_gate_sets_true_for_mentioned(self, adapter, monkeypatch):
+        """Soft gate still marks mentioned as addressed=True."""
+        monkeypatch.setenv("ZULIP_SOFT_GATE", "true")
+        monkeypatch.setenv("ZULIP_CHATMODE", "oncall")
+        msg = self._msg(content="hey @soju-bot", flags=["mentioned"])
+        await adapter._handle_message(msg)
+        adapter.handle_message.assert_called_once()
+        call_args = adapter.handle_message.call_args[0][0]
+        assert call_args.metadata.get("addressed") is True
+
+    @pytest.mark.asyncio
+    async def test_soft_gate_disabled_uses_hard_gate(self, adapter, monkeypatch):
+        """When soft gate false (default), non-mentioned oncall is dropped."""
+        monkeypatch.setenv("ZULIP_SOFT_GATE", "false")
+        monkeypatch.setenv("ZULIP_CHATMODE", "oncall")
+        msg = self._msg(content="non mentioned")
+        await adapter._handle_message(msg)
+        adapter.handle_message.assert_not_called()
+
