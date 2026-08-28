@@ -1,8 +1,9 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+## Unreleased
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+### Fixed
+- **Zulip session routing**: Per-topic streams (ZULIP_TOPIC_SESSIONS) now pass `chat_type="thread"` (plus `thread_id=topic`) to `build_source`. This makes `build_session_key()` and `_parse_session_key()` (and other routing helpers) correctly extract the topic as `thread_id` instead of dropping it for `chat_type="stream"`. Messages in a topic now reliably route to their own Hermes session rather than the parent stream session. (kanban t_e1157206)
 
 ## [1.8.1] - 2026-08-25
 
