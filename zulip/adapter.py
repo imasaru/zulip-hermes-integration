@@ -34,6 +34,7 @@ from .text_utils import (
     create_mention_regex,
     normalize_mention,
     strip_html_to_text,
+    strip_think_blocks,
 )
 from .media import upload_file_to_zulip
 from .queue_manager import ZulipQueueManager
@@ -609,6 +610,84 @@ class ZulipAdapter(BasePlatformAdapter):
         self._display_names_loaded = False
         self._load_display_names()
 
+    # ------------------------------------------------------------------
+    # Display name cache (persisted, mirrors LINE's approach)
+    # ------------------------------------------------------------------
+
+    def _get_display_names_path(self) -> Path:
+        """Return the path for the persisted Zulip display name cache."""
+        try:
+            from hermes_constants import get_hermes_home
+            base = Path(get_hermes_home())
+        except Exception:
+            base = Path.home() / ".hermes"
+        return base / "cache" / "zulip_display_names.json"
+
+    def _load_display_names(self) -> None:
+        """Load previously persisted display_names. Failures are non-fatal."""
+        path = self._get_display_names_path()
+        try:
+            if not path.exists():
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            dn = data.get("display_names") or {}
+            if isinstance(dn, dict):
+                for k, v in dn.items():
+                    self._display_names[str(k)] = str(v)
+            self._display_names_loaded = True
+            logger.debug("Zulip: loaded %d display names from %s", len(self._display_names), path)
+        except Exception as exc:
+            logger.debug("Zulip: failed to load display names cache %s: %s", path, exc)
+
+    def _save_display_names(self) -> None:
+        """Persist the current display name cache (atomic write)."""
+        if not self._display_names:
+            return
+        path = self._get_display_names_path()
+        try:
+            # Merge on-disk first so we never lose older entries
+            existing = {}
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    existing = {}
+            merged_dn = {**(existing.get("display_names") or {}), **self._display_names}
+            if not merged_dn:
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"version": 1, "display_names": merged_dn}
+            from utils import atomic_json_write
+            atomic_json_write(path, payload)
+        except Exception as exc:
+            logger.debug("Zulip: failed to save display names cache: %s", exc)
+
+    async def _ensure_display_name(self, sender_id: str) -> None:
+        """Best-effort background fetch of a user's display name.
+
+        Uses the Zulip SDK get_user endpoint. Results are cached in-memory
+        and persisted to disk so they survive restarts.
+        """
+        if sender_id in self._display_names:
+            return  # already cached
+        try:
+            user = await self._sdk_call(
+                self.zulip_client.get_user,
+                int(sender_id),
+                timeout=self._connect_timeout,
+            )
+            if user and user.get("full_name"):
+                self._display_names[sender_id] = user["full_name"]
+                self._save_display_names()
+        except Exception as exc:
+            logger.debug("Zulip: failed to fetch display name for %s: %s", sender_id, exc)
+
+    def _get_display_name(self, sender_id: str) -> str:
+        """Return the cached display name for a user, or empty string."""
+        return self._display_names.get(sender_id, "")
+
     async def _sdk_call(self, fn, *args, timeout: float, **kwargs):
         """Wrap a synchronous SDK call in asyncio.to_thread + asyncio.wait_for.
 
@@ -701,9 +780,11 @@ class ZulipAdapter(BasePlatformAdapter):
                 return
 
             content = strip_html_to_text(message.get("content", "") or "")
+            content = strip_think_blocks(content)
             message_id = str(message.get("id", ""))
             sender_email = message.get("sender_email", "")
             sender_full_name = message.get("sender_full_name", "Unknown") or "Unknown"
+            sender_id = str(message.get("sender_id", ""))
             stream_id = message.get("stream_id")
             topic = (message.get("subject") or "").strip()
             stream_name = message.get("display_recipient", str(stream_id) if stream_id is not None else "unknown")
@@ -713,6 +794,9 @@ class ZulipAdapter(BasePlatformAdapter):
             # Match processing path for per-topic session keys
             use_thread = bool(topic and _topic_sessions_enabled())
 
+            # Use cached display name if available (updated by _ensure_display_name)
+            display_name = self._get_display_name(sender_id) or sender_full_name
+
             from gateway.session import SessionSource
             from gateway.config import Platform
 
@@ -721,7 +805,7 @@ class ZulipAdapter(BasePlatformAdapter):
                 "chat_name": stream_name,
                 "chat_type": "thread" if use_thread else "stream",
                 "user_id": sender_email,
-                "user_name": sender_full_name,
+                "user_name": display_name,
             }
             if use_thread:
                 source_kwargs["thread_id"] = topic
@@ -732,7 +816,7 @@ class ZulipAdapter(BasePlatformAdapter):
             )
 
             # Simple attribution (expand later with bridged/display cache if added)
-            attributed = f"[{sender_full_name}]\\n{content}"
+            attributed = f"[{display_name}]\n{content}"
 
             entry: dict = {
                 "role": "user",
@@ -1066,6 +1150,9 @@ class ZulipAdapter(BasePlatformAdapter):
         # Strip Zulip @-mention syntax and HTML
         content = strip_html_to_text(content)
 
+        # Strip thinking/reasoning blocks from agent output that may leak through
+        content = strip_think_blocks(content)
+
         # --- Reactions ---
         # Constructed here so the error path below can reach it, but not
         # started until the message has cleared every drop path. See the
@@ -1148,6 +1235,11 @@ class ZulipAdapter(BasePlatformAdapter):
                     return
 
             # --- Group policy check (Issue #66) ---
+            # Fetch display name for group message attribution (background)
+            sender_id = message.get("sender_id")
+            if sender_id and msg_type == "stream":
+                asyncio.create_task(self._ensure_display_name(str(sender_id)))
+
             if not self._policy.can_group_message(sender_email):
                 await self._audit_logger.log_policy_block(
                     sender_id=sender_email,
