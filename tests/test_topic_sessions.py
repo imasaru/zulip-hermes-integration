@@ -111,3 +111,12 @@ class TestTopicScoping:
         source = adapter.handle_message.call_args[0][0].source
         assert source.chat_type == "dm"
         assert not getattr(source, "thread_id", "")
+
+    @pytest.mark.asyncio
+    async def test_topic_stripped_and_thread_chat_type(self, adapter, monkeypatch):
+        monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
+        monkeypatch.setenv("ZULIP_TOPIC_SESSIONS", "true")
+        await adapter._handle_message(self._stream_msg("  foo bar  "))
+        source = adapter.handle_message.call_args[0][0].source
+        assert source.thread_id == "foo bar"
+        assert source.chat_type == "thread"
