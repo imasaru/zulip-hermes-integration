@@ -13,7 +13,7 @@ import tempfile
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, Any, overload
+from typing import Any, Dict, Optional, Set, overload
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -492,6 +492,10 @@ class ZulipAdapter(BasePlatformAdapter):
         # Populated on connect. Zulip renders mentions from the display name,
         # not the email local-part, so mention matching needs it.
         self.bot_full_name = ""
+        # Populated on connect from probe_zulip /users/me. Used for robust
+        # self-message filtering (email + sender_id) to match LINE behavior
+        # and handle races/subscribed streams.
+        self._bot_user_id: str = ""
 
         # Validate site URL to prevent SSRF before creating client
         if self.site:
@@ -537,6 +541,14 @@ class ZulipAdapter(BasePlatformAdapter):
         # Matches LINE_SOFT_GATE behavior.
         self._soft_gate = (
             os.getenv("ZULIP_SOFT_GATE", "").strip().lower() in ("true", "1", "yes", "on")
+        )
+
+        # Group/stream message observation (observe-then-decide, like LINE).
+        # When True (and hard gate), non-addressed stream messages are appended
+        # to the session transcript (with "observed": True) WITHOUT dispatching
+        # to the LLM. Keeps bot context current for later @mentions.
+        self._observe_group = (
+            os.getenv("ZULIP_OBSERVE_GROUP", "").strip().lower() in ("true", "1", "yes", "on")
         )
 
         self._data_dir = os.environ.get("HERMES_DATA_DIR", os.path.expanduser("~/.hermes"))
@@ -657,6 +669,91 @@ class ZulipAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    # ------------------------------------------------------------------
+    # Stream/group message observation (observe-then-decide, matching LINE)
+    # ------------------------------------------------------------------
+
+    def _observe_stream_message(self, message: dict) -> None:
+        """Write a stream message into the session transcript without triggering the agent.
+
+        This allows the model to see the full stream conversation when it is
+        eventually invoked via @bot or onchar. Messages are stored with
+        ``role: "user"`` using the sender's full name for attribution (consistent
+        with how source.user_name is used). The entry is tagged ``"observed": True``.
+
+        Does NOT trigger handle_message / LLM dispatch.
+        """
+        if not getattr(self, "_observe_group", False):
+            return
+        store = getattr(self, "_session_store", None)
+        if not store:
+            return
+        try:
+            if message.get("type") != "stream":
+                return
+            # Already filtered self by email earlier, but be defensive
+            if message.get("sender_email") == getattr(self, "email", None):
+                return
+
+            content = strip_html_to_text(message.get("content", "") or "")
+            message_id = str(message.get("id", ""))
+            sender_email = message.get("sender_email", "")
+            sender_full_name = message.get("sender_full_name", "Unknown") or "Unknown"
+            stream_id = message.get("stream_id")
+            topic = (message.get("subject") or "").strip()
+            stream_name = message.get("display_recipient", str(stream_id) if stream_id is not None else "unknown")
+
+            chat_id = str(stream_id) if stream_id is not None else ""
+
+            # Match processing path for per-topic session keys
+            use_thread = bool(topic and _topic_sessions_enabled())
+
+            from gateway.session import SessionSource
+            from gateway.config import Platform
+
+            source_kwargs: dict[str, Any] = {
+                "chat_id": chat_id,
+                "chat_name": stream_name,
+                "chat_type": "thread" if use_thread else "stream",
+                "user_id": sender_email,
+                "user_name": sender_full_name,
+            }
+            if use_thread:
+                source_kwargs["thread_id"] = topic
+
+            source = SessionSource(
+                platform=Platform("zulip"),
+                **source_kwargs,
+            )
+
+            # Simple attribution (expand later with bridged/display cache if added)
+            attributed = f"[{sender_full_name}]\\n{content}"
+
+            entry: dict = {
+                "role": "user",
+                "content": attributed,
+                "timestamp": __import__("datetime").datetime.now(
+                    tz=__import__("datetime").timezone.utc
+                ).isoformat(),
+                "observed": True,
+            }
+            if message_id:
+                entry["message_id"] = message_id
+
+            session_entry = store.get_or_create_session(source)
+            store.append_to_transcript(
+                session_entry.session_id,
+                entry,
+            )
+            logger.debug(
+                "zulip observed stream msg [stream=%s topic=%s sender=%s]",
+                mask_pii(stream_name),
+                mask_pii(topic),
+                mask_pii(sender_email),
+            )
+        except Exception as exc:
+            logger.warning("zulip: Failed to observe stream message: %s", exc)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Initialize connection and start listening."""
         logger.info("Zulip adapter connecting...")
@@ -682,6 +779,8 @@ class ZulipAdapter(BasePlatformAdapter):
                 id=bot.get("id"),
             )
         )
+
+        self._bot_user_id = str(bot.get("id", ""))
 
         # 1. Verify server is reachable (no auth required)
         try:
@@ -885,6 +984,11 @@ class ZulipAdapter(BasePlatformAdapter):
                         if self._dedupe.check(msg_id):
                             logger.debug("zulip dedupe hit [msg=%s]", mask_pii(msg_id))
                             continue
+                        # Early self-message filter (before scheduling task / rate limit etc)
+                        # to match LINE's early drop in _dispatch_event.
+                        if self._is_self_message(msg):
+                            logger.debug("zulip self-message dropped [msg=%s]", mask_pii(msg_id))
+                            continue
                         # Process messages concurrently so a slow model call
                         # does not block the poll loop for unrelated messages.
                         # Per-session serialization is handled by the gateway.
@@ -910,10 +1014,28 @@ class ZulipAdapter(BasePlatformAdapter):
                 )
                 await asyncio.sleep(5)
 
+    def _is_self_message(self, message: dict) -> bool:
+        """Return True if the message was sent by this bot (self-echo prevention).
+
+        Matches LINE's self-message filter:
+        - by configured email (sender_email)
+        - by sender_id from probe_zulip /users/me (for robustness on
+          subscribed streams and config races)
+        """
+        if not isinstance(message, dict):
+            return False
+        if message.get("sender_email") == self.email:
+            return True
+        if getattr(self, "_bot_user_id", None):
+            sid = str(message.get("sender_id", "") or "")
+            if sid and sid == self._bot_user_id:
+                return True
+        return False
+
     async def _handle_message(self, message: dict):
         """Process incoming Zulip message."""
-        # Filter self-messages to prevent loops
-        if message.get("sender_email") == self.email:
+        # Filter self-messages to prevent loops (email or sender_id)
+        if self._is_self_message(message):
             return
 
         msg_type = message.get("type")  # "stream" or "private"
@@ -1004,6 +1126,8 @@ class ZulipAdapter(BasePlatformAdapter):
                 should_process = False
 
             if not should_process:
+                if msg_type == "stream" and getattr(self, "_observe_group", False):
+                    self._observe_stream_message(message)
                 logger.debug("zulip drop [mode=%s, no trigger] msg=%s", chatmode, mask_pii(str(message_id)))
                 return
 

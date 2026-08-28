@@ -413,3 +413,98 @@ class TestSoftGate:
         await adapter._handle_message(msg)
         adapter.handle_message.assert_not_called()
 
+
+class TestSelfMessageFiltering:
+    """Test robust self-message filtering by email and by sender_id (like LINE)."""
+
+    @pytest.fixture
+    def adapter(self, mock_platform_config, monkeypatch):
+        import zulip.adapter as adapter_module
+        monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
+
+        class MockZulipModule:
+            class Client:
+                def __init__(self, email=None, api_key=None, site=None):
+                    pass
+
+                def set_typing_status(self, *a, **k):
+                    pass
+
+                def add_reaction(self, *a, **k):
+                    pass
+
+                def remove_reaction(self, *a, **k):
+                    pass
+
+                def update_message_flags(self, *a, **k):
+                    pass
+
+                def send_message(self, *a, **k):
+                    pass
+
+        monkeypatch.setattr(adapter_module, "zulip", MockZulipModule())
+        from zulip.adapter import ZulipAdapter
+        a = ZulipAdapter(mock_platform_config)
+        a.email = "bot@test.zulipchat.com"
+        a.bot_full_name = "TestBot"
+        a._bot_user_id = "424242"
+        a.handle_message = AsyncMock()
+        a._sdk_call = AsyncMock(return_value={"result": "success", "id": 1})
+        return a
+
+    def _msg(self, **overrides):
+        m = {
+            "id": 123,
+            "type": "stream",
+            "stream_id": 30,
+            "subject": "general",
+            "display_recipient": "general",
+            "content": "hello",
+            "sender_email": "user@example.com",
+            "sender_full_name": "User",
+            "sender_id": 999,
+            "flags": [],
+        }
+        m.update(overrides)
+        return m
+
+    @pytest.mark.asyncio
+    async def test_drops_self_by_email(self, adapter):
+        msg = self._msg(sender_email=adapter.email)
+        await adapter._handle_message(msg)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_drops_self_by_sender_id(self, adapter):
+        msg = self._msg(sender_email="other@ex.com", sender_id="424242")
+        await adapter._handle_message(msg)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_drops_self_by_id_even_if_email_diff(self, adapter):
+        # Robustness case
+        msg = self._msg(sender_email="bot@test.zulipchat.com", sender_id="424242")
+        await adapter._handle_message(msg)
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_processes_foreign_message(self, adapter, monkeypatch):
+        """Foreign (non-self) message must reach handle_message (use onmessage to bypass gate)."""
+        monkeypatch.setenv("ZULIP_CHATMODE", "onmessage")
+        msg = self._msg(sender_email="user@ex.com", sender_id="99999")
+        await adapter._handle_message(msg)
+        adapter.handle_message.assert_called_once()
+
+    def test_is_self_message_helper_email(self, adapter):
+        assert adapter._is_self_message({"sender_email": adapter.email}) is True
+        assert adapter._is_self_message({"sender_email": "other"}) is False
+
+    def test_is_self_message_helper_id(self, adapter):
+        assert adapter._is_self_message({"sender_email": "x", "sender_id": "424242"}) is True
+        assert adapter._is_self_message({"sender_email": "x", "sender_id": 424242}) is True
+        assert adapter._is_self_message({"sender_email": "x", "sender_id": "999"}) is False
+
+    def test_is_self_message_helper_no_id_set(self, adapter):
+        adapter._bot_user_id = ""
+        assert adapter._is_self_message({"sender_email": adapter.email}) is True
+        assert adapter._is_self_message({"sender_email": "x", "sender_id": "424242"}) is False
