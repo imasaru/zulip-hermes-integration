@@ -309,3 +309,98 @@ class TestPerStreamGating:
         monkeypatch.setenv("ZULIP_STREAM_OVERRIDES", '{"quiet room": {"chatmode": "oncall"}}')
         await adapter._handle_message(self._msg("no mention here", "quiet room"))
         adapter.handle_message.assert_not_called()
+
+class TestGroupObservation:
+    """Tests for ZULIP_OBSERVE_GROUP: stores non-addressed without triggering LLM."""
+
+    @pytest.fixture
+    def adapter(self, mock_platform_config, monkeypatch):
+        import zulip.adapter as adapter_module
+        monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
+
+        class MockZulipModule:
+            class Client:
+                def __init__(self, email=None, api_key=None, site=None):
+                    pass
+
+        monkeypatch.setattr(adapter_module, "zulip", MockZulipModule())
+        from zulip.adapter import ZulipAdapter
+        a = ZulipAdapter(mock_platform_config)
+        a.email = "bot@zulip.com"
+        a.handle_message = AsyncMock()
+        return a
+
+    def _make_stream_msg(self, content: str, sender_name: str = "User") -> dict:
+        return {
+            "id": 42,
+            "type": "stream",
+            "stream_id": 7,
+            "subject": "general",
+            "display_recipient": "test",
+            "content": content,
+            "sender_email": "user@zulip.com",
+            "sender_full_name": sender_name,
+            "sender_id": 99,
+            "timestamp": 1720000000,
+        }
+
+    @pytest.mark.asyncio
+    async def test_observe_on_hard_gate_drop_no_llm(self, adapter, monkeypatch):
+        # Enable observe, use hard gate oncall (no mention => drop)
+        adapter._observe_group = True  # set post-init since env read at creation
+        monkeypatch.setenv("ZULIP_CHATMODE", "oncall")
+
+        mock_store = MagicMock()
+        sess = MagicMock()
+        sess.session_id = "test-sess-obs-1"
+        mock_store.get_or_create_session.return_value = sess
+        adapter._session_store = mock_store
+
+        msg = self._make_stream_msg("just chatting here")
+        await adapter._handle_message(msg)
+
+        # Must NOT dispatch to LLM
+        adapter.handle_message.assert_not_called()
+
+        # Must have observed exactly once
+        mock_store.get_or_create_session.assert_called_once()
+        mock_store.append_to_transcript.assert_called_once()
+
+        args = mock_store.append_to_transcript.call_args[0]
+        assert args[0] == "test-sess-obs-1"
+        entry = args[1]
+        assert entry.get("observed") is True
+        assert entry.get("role") == "user"
+        assert "[User]" in entry.get("content", "")
+        assert "just chatting here" in entry.get("content", "")
+        assert "message_id" in entry
+
+    @pytest.mark.asyncio
+    async def test_observe_disabled_does_nothing(self, adapter, monkeypatch):
+        adapter._observe_group = False
+        monkeypatch.setenv("ZULIP_CHATMODE", "oncall")
+
+        mock_store = MagicMock()
+        adapter._session_store = mock_store
+
+        msg = self._make_stream_msg("chatter ignored")
+        await adapter._handle_message(msg)
+
+        adapter.handle_message.assert_not_called()
+        mock_store.append_to_transcript.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_observe_soft_gate_never_observes(self, adapter, monkeypatch):
+        # In soft gate, even non-mentioned are dispatched (addressed=False)
+        adapter._observe_group = True
+        adapter._soft_gate = True
+
+        mock_store = MagicMock()
+        adapter._session_store = mock_store
+
+        msg = self._make_stream_msg("non mentioned in soft")
+        await adapter._handle_message(msg)
+
+        # Dispatched, no observe
+        adapter.handle_message.assert_called_once()
+        mock_store.append_to_transcript.assert_not_called()

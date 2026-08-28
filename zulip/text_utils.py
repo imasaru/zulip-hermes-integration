@@ -341,3 +341,89 @@ def _format_zulip_table(table_lines: list[str]) -> list[str]:
             formatted.append(line)
 
     return formatted
+
+
+# ---------------------------------------------------------------------------
+# Thinking/reasoning block stripping (robust final-response cleaning for Zulip)
+# Ported/adapted from LINE's strip_think_blocks() (and ultimately
+# agent/agent_runtime_helpers.py) so the Zulip adapter can guarantee clean
+# visible text even when the gateway passes raw agent output containing
+# <think> / <reasoning> blocks (interim or final).
+# ---------------------------------------------------------------------------
+
+_REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought")
+_TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
+
+_REASONING_BLOCK_PATTERNS = tuple(
+    re.compile(rf"<{name}>.*?</{name}>", re.DOTALL | re.IGNORECASE)
+    for name in _REASONING_TAG_NAMES
+)
+
+_TOOL_CALL_BLOCK_PATTERNS = tuple(
+    re.compile(rf"<{name}\b[^>]*>.*?</{name}>", re.DOTALL | re.IGNORECASE)
+    for name in _TOOL_CALL_TAG_NAMES
+)
+
+_NAMED_FUNCTION_BLOCK_PATTERN = re.compile(
+    r'(?:(?<=^)|(?<=[\n\r.!?:]))[ \t]*'
+    r'<function\b[^>]*\bname\s*=[^>]*>'
+    r'(?:(?:(?!</function>).)*)</function>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+_UNTERMINATED_REASONING_BLOCK_PATTERN = re.compile(
+    rf'(?:^|\n)[ \t]*<(?:{"|".join(_REASONING_TAG_NAMES)})\b[^>]*>.*$',
+    re.DOTALL | re.IGNORECASE,
+)
+
+_ORPHAN_REASONING_TAG_PATTERN = re.compile(
+    rf'</?(?:{"|".join(_REASONING_TAG_NAMES)})>\s*',
+    re.IGNORECASE,
+)
+
+_STRAY_TOOL_CALL_CLOSER_PATTERN = re.compile(
+    rf'</(?:{"|".join(_TOOL_CALL_TAG_NAMES)}|function)>\s*',
+    re.IGNORECASE,
+)
+
+
+def strip_think_blocks(text: str) -> str:
+    """Remove reasoning/thinking blocks (and some tool XML) returning only visible text.
+
+    Standalone version for the Zulip adapter (no agent dep). Matches LINE's
+    implementation exactly. Ported from agent/agent_runtime_helpers.py so the
+    adapter can guarantee clean visible text even when the gateway passes raw
+    agent output containing <think> / <reasoning> blocks (interim or final).
+    """
+    if not text:
+        return text
+    if not isinstance(text, str):
+        if isinstance(text, list):
+            _parts: list[str] = []
+            for _part in text:
+                if isinstance(_part, str):
+                    _parts.append(_part)
+                elif isinstance(_part, dict):
+                    _parts.append(str(_part.get("text") or _part.get("content") or ""))
+            text = "".join(_parts)
+        elif isinstance(text, dict):
+            text = str(text.get("text") or text.get("content") or "")
+        else:
+            text = str(text)
+        if not text:
+            return ""
+    # 1. Closed tag pairs
+    for _pattern in _REASONING_BLOCK_PATTERNS:
+        text = _pattern.sub("", text)
+    # 1b. Tool-call XML blocks
+    for _pattern in _TOOL_CALL_BLOCK_PATTERNS:
+        text = _pattern.sub("", text)
+    # 1c. <function name=...>
+    text = _NAMED_FUNCTION_BLOCK_PATTERN.sub("", text)
+    # 2. Unterminated open reasoning block at boundary
+    text = _UNTERMINATED_REASONING_BLOCK_PATTERN.sub("", text)
+    # 3. Orphan tags
+    text = _ORPHAN_REASONING_TAG_PATTERN.sub("", text)
+    # 3b. Stray tool closers
+    text = _STRAY_TOOL_CALL_CLOSER_PATTERN.sub("", text)
+    return text

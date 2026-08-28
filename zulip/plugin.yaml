@@ -83,3 +83,6 @@ optional_env:
   - name: ZULIP_SOFT_GATE
     description: 'Soft gate: dispatch all stream messages (like onmessage) but set addressed=False in metadata for messages that do not explicitly mention the bot (LLM decides relevance). Default: false (hard gate).'
     prompt: "Enable ZULIP soft gate mode"
+  - name: ZULIP_OBSERVE_GROUP
+    description: "Observe non-addressed (unmentioned) stream messages into the session transcript for context (default: false, like LINE). Keeps bot aware of ongoing conversation when eventually @mentioned."
+    prompt: "Observe group/stream messages"

@@ -604,6 +604,11 @@ class ZulipAdapter(BasePlatformAdapter):
         self._event_task: Optional[asyncio.Task] = None
         self._presence_task: Optional[asyncio.Task] = None
 
+        # Display name cache (Issue #47 — group message attribution)
+        self._display_names: Dict[str, str] = {}  # user_id → display_name
+        self._display_names_loaded = False
+        self._load_display_names()
+
     async def _sdk_call(self, fn, *args, timeout: float, **kwargs):
         """Wrap a synchronous SDK call in asyncio.to_thread + asyncio.wait_for.
 
