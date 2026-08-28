@@ -1176,6 +1176,11 @@ class ZulipAdapter(BasePlatformAdapter):
         self._event_task: Optional[asyncio.Task] = None
         self._presence_task: Optional[asyncio.Task] = None
 
+        # Display name cache (Issue #47 — group message attribution)
+        self._display_names: Dict[str, str] = {}  # user_id → display_name
+        self._display_names_loaded = False
+        self._load_display_names()
+
         # Activity trace (epic #139 / #158): one bot-owned status message per
         # work item, edited in place. Disabled unless ZULIP_ACTIVITY_TRACE is set.
         self._trace_cfg = TraceConfig.from_env()
