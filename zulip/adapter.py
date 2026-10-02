@@ -4315,7 +4315,18 @@ def _env_enablement() -> dict | None:
     if not (key and email and site):
         return None
 
-    return {"api_key": key, "email": email, "site": site}
+    extra: dict = {"api_key": key, "email": email, "site": site}
+
+    # Home channel: gateway restart/startup notifications destination.
+    home_channel = os.getenv("ZULIP_HOME_CHANNEL", "").strip()
+    if home_channel:
+        extra["home_channel"] = {
+            "chat_id": home_channel,
+            "name": os.getenv("ZULIP_HOME_CHANNEL_NAME", "Home").strip() or "Home",
+            "thread_id": os.getenv("ZULIP_HOME_CHANNEL_THREAD_ID", "").strip() or None,
+        }
+
+    return extra
 
 
 def interactive_setup() -> None:
@@ -4390,6 +4401,26 @@ def interactive_setup() -> None:
     )
     if allowed:
         save_env_value("ZULIP_ALLOWED_USERS", allowed.strip())
+
+    # Home channel (optional) — where Hermes sends gateway restart/startup notifications.
+    if prompt_yes_no("Configure a home channel for gateway notifications?", False):
+        home_stream = prompt(
+            "Stream ID (numeric, e.g. 614901)",
+            default=get_env_value("ZULIP_HOME_CHANNEL") or "",
+        )
+        if home_stream:
+            save_env_value("ZULIP_HOME_CHANNEL", home_stream.strip())
+            home_name = prompt(
+                "Home channel display name",
+                default=get_env_value("ZULIP_HOME_CHANNEL_NAME") or "Home",
+            )
+            save_env_value("ZULIP_HOME_CHANNEL_NAME", home_name.strip())
+            home_thread = prompt(
+                "Thread/topic ID (optional, leave empty for none)",
+                default=get_env_value("ZULIP_HOME_CHANNEL_THREAD_ID") or "",
+            )
+            if home_thread:
+                save_env_value("ZULIP_HOME_CHANNEL_THREAD_ID", home_thread.strip())
 
     print_success("Zulip configured.")
     print_info("Tip: Subscribe your bot to streams via Stream settings → Subscribers")
