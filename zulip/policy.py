@@ -55,7 +55,11 @@ class PolicyEngine:
 
         # Disk persistence for allowlist
         self._data_dir = Path(data_dir).expanduser() if data_dir else None
-        self._loaded_mtime: Optional[float] = None
+        # (mtime, size, inode) of the data file as last read/written —
+        # a change signal robust to coarse timestamp granularity (two
+        # rapid saves can share an mtime tick; os.replace still swaps
+        # the inode).
+        self._loaded_stamp: Optional[tuple[float, int, int]] = None
         self._load_from_disk()
 
     def _persistence_path(self) -> Optional[Path]:
@@ -79,7 +83,8 @@ class PolicyEngine:
             self.group_allowlist = self._parse_group_allowlist() | disk_group_allowlist
             self._restore_pairing(data)
             try:
-                self._loaded_mtime = path.stat().st_mtime
+                st = path.stat()
+                self._loaded_stamp = (st.st_mtime, st.st_size, st.st_ino)
             except OSError:
                 pass
             logger.info(
@@ -120,17 +125,23 @@ class PolicyEngine:
 
         Approval happens out of process (``python -m zulip.pairing``), so the
         running gateway has to notice the new allowlist. Cheap: one stat().
-        A revocation also lands here, because _load_from_disk rebuilds the
-        set from env + disk rather than merging into what is already held.
+
+        mtime alone is not a reliable change signal: file writes are stamped
+        with a coarse clock, so two rapid saves can share an mtime tick.
+        Size and inode ride along in the same stat() — every save goes
+        through ``os.replace``, so the inode changes even when mtime and
+        size collide. A revocation also lands here, because _load_from_disk
+        rebuilds the set from env + disk rather than merging into what is
+        already held.
         """
         path = self._persistence_path()
         if not path:
             return
         try:
-            mtime = path.stat().st_mtime
+            st = path.stat()
         except OSError:
             return
-        if mtime != self._loaded_mtime:
+        if (st.st_mtime, st.st_size, st.st_ino) != self._loaded_stamp:
             self._load_from_disk()
 
     def _save_to_disk(self) -> None:
@@ -164,7 +175,8 @@ class PolicyEngine:
                 temp_path = f.name
             os.replace(temp_path, path)
             try:
-                self._loaded_mtime = path.stat().st_mtime
+                st = path.stat()
+                self._loaded_stamp = (st.st_mtime, st.st_size, st.st_ino)
             except OSError:
                 pass
             # Restrict file permissions to owner-only (0600)

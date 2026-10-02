@@ -548,7 +548,7 @@ choice when you do not want a code at all: it just reads `ZULIP_ALLOWED_USERS`.
 
 | Variable | Default | Example | Notes |
 |----------|---------|---------|-------|
-| `ZULIP_TOPIC_SESSIONS` | `false` | `true` | give each topic its own session |
+| `ZULIP_TOPIC_SESSIONS` | `false` | `true` | give each topic its own session — rename-proof: sessions key on stable conversation ids, so renaming a topic continues its session; `/new` starts a fresh one |
 | `ZULIP_DM_SESSION_TURN_LIMIT` | `20` | `0` | rotate a DM session after N turns; `0` disables |
 | `ZULIP_SESSION_QUEUE` | `false` | `1` | hold a mid-run message behind the running turn |
 | `ZULIP_QUEUE_CAP` | `20` | `5` | how many may wait before dispatching immediately |
