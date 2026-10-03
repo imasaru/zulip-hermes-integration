@@ -4737,3 +4737,15 @@ def register(ctx):
         emoji="📬",
         setup_fn=interactive_setup,
     )
+
+    # Auto-patch _KNOWN_DELIVERY_PLATFORMS in all workspace copies so cron
+    # delivery to Zulip survives Hermes upgrades.  Runs every time the plugin
+    # loads (gateway restart / plugin reload) — idempotent, safe to repeat.
+    try:
+        from . import cron_patch
+        for ws in cron_patch.find_workspaces():
+            cron_patch.patch_scheduler_delivery(ws)
+    except Exception:
+        # Best-effort — if the module is missing or the glob doesn't match,
+        # the standalone ``python -m zulip.cron_patch`` command still works.
+        pass
