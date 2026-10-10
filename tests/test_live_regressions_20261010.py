@@ -48,6 +48,12 @@ _CHILD = textwrap.dedent(
     r'''
     import asyncio, importlib.util, json, os, sys, types
     repo, stubs, action = sys.argv[1], sys.argv[2], sys.argv[3]
+    env_site = os.environ.get("EMULATE_HERMES_ENV_SITE")
+    if env_site:
+        # Hermes' gateway bootstrap puts an environment venv's site-packages on
+        # sys.path in place of the bundled runtime's, and that venv has no SDK.
+        real = {os.path.realpath(p) for p in sys.path if "site-packages" in p}
+        sys.path[:] = [env_site if os.path.realpath(p) in real else p for p in sys.path]
     plugin_dir = os.path.join(repo, "zulip")
     sys.path.insert(0, stubs)
     sys.path.insert(0, repo)  # plugins dir on sys.path, like Hermes
@@ -227,6 +233,59 @@ class TestFreshProcessSdkImport:
         assert out["returned_none"] is True
         assert out["client_error_type"] == "ImportError", out
         assert "zulip package not installed" in out["client_error"]
+
+
+def _env_venv_without_sdk(tmp_path: Path, site_packages: Path) -> Path:
+    """An 'environment venv' site-packages: everything the runtime has except
+    the zulip SDK (what the live gateway's sys.path pointed at)."""
+    env = tmp_path / "env-venv-site"
+    env.mkdir()
+    for entry in site_packages.iterdir():
+        if entry.name.lower().startswith("zulip"):
+            continue
+        os.symlink(entry, env / entry.name)
+    return env
+
+
+class TestHermesGatewayBootstrapSysPath:
+    def test_sdk_found_when_bootstrap_swapped_site_packages(self, tmp_path):
+        """SCENARIO: live on 2026-10-11 after installing the v1.12.0 merge, the
+        gateway logged "zulip SDK import failed: No module named 'zulip'" and
+        skipped the Zulip platform. Hermes' bootstrap had replaced the bundled
+        runtime's site-packages on sys.path with an environment venv that lacks
+        the SDK; the SDK is installed only in the bundled runtime itself.
+        EXPECTED: the real SDK (with Client) is still found and returned, no
+        exception, sys.path is left exactly as the host set it, and building a
+        client works (no "not installed" error)."""
+        sp = _site_packages_with_sdk()
+        py = _hermes_runtime_python(tmp_path, sp)
+        env_site = _env_venv_without_sdk(tmp_path, sp)
+        out = _run_child(py, "import", tmp_path,
+                         extra_env={"EMULATE_HERMES_ENV_SITE": str(env_site)})
+        assert "exc_type" not in out, out
+        assert out["has_client"] is True, out
+        assert not str(out["sdk_file"]).startswith(str(PLUGIN_DIR)), out
+        assert out["sys_path_unchanged"] is True
+        assert out["plugin_modules_intact"] is True
+        assert out["client_error"] is None, out
+
+    def test_cron_delivery_succeeds_when_bootstrap_swapped_site_packages(self, tmp_path):
+        """SCENARIO: same host layout, out-of-process cron delivery to
+        zulip:614901:daily-morning-report (network stubbed).
+        EXPECTED: delivered once to stream 614901 / topic daily-morning-report
+        with the body; never 'not installed'."""
+        sp = _site_packages_with_sdk()
+        py = _hermes_runtime_python(tmp_path, sp)
+        env_site = _env_venv_without_sdk(tmp_path, sp)
+        out = _run_child(py, "standalone_send", tmp_path,
+                         extra_env={"EMULATE_HERMES_ENV_SITE": str(env_site)})
+        res = out["result"]
+        assert "not installed" not in json.dumps(res), res
+        assert res.get("success") is True, res
+        assert len(out["requests"]) == 1, out
+        body = str(out["requests"][0]["data"])
+        assert "614901" in body and "daily-morning-report" in body
+        assert "Morning report body" in body
 
 
 class TestCronStandaloneDeliveryFreshProcess:

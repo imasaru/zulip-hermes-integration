@@ -13,6 +13,7 @@ module.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import logging
 import sys
 from collections import OrderedDict
@@ -259,6 +260,65 @@ def _resolved_to_this_package(module: Any) -> bool:
         return False
 
 
+def _runtime_sdk_candidates() -> list[Path]:
+    """``zulip/__init__.py`` candidates in the running interpreter's own
+    site-packages (and its base install), which may be absent from sys.path."""
+    roots = []
+    for prefix in (sys.prefix, getattr(sys, "base_prefix", sys.prefix),
+                   str(Path(sys.executable or "").resolve().parent.parent)):
+        if prefix and prefix not in roots:
+            roots.append(prefix)
+    out: list[Path] = []
+    for root in roots:
+        lib = Path(root) / "lib"
+        try:
+            entries = sorted(lib.iterdir()) if lib.is_dir() else []
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.name.startswith("python"):
+                out.append(entry / "site-packages" / "zulip" / "__init__.py")
+    return out
+
+
+def _load_sdk_from_runtime() -> Any:
+    """Import the SDK from the interpreter's site-packages by file path.
+
+    Returns the module (also bound as ``sys.modules["zulip"]`` only when that
+    name is free) or ``None``. Never raises and never mutates ``sys.path``.
+    """
+    for candidate in _runtime_sdk_candidates():
+        try:
+            if not candidate.is_file() or candidate.resolve() == _PLUGIN_PACKAGE_INIT:
+                continue
+            if "class Client" not in candidate.read_text(encoding="utf-8", errors="ignore"):
+                continue
+        except OSError:
+            continue
+        name = "zulip" if "zulip" not in sys.modules else "_hermes_zulip_sdk"
+        try:
+            spec = importlib.util.spec_from_file_location(
+                name, str(candidate), submodule_search_locations=[str(candidate.parent)]
+            )
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(name, None)
+                raise
+            if not hasattr(module, "Client"):
+                sys.modules.pop(name, None)
+                continue
+            logger.info("zulip: loaded SDK from %s", candidate)
+            return module
+        except Exception as exc:
+            logger.error("zulip: SDK load from %s failed: %s", candidate, exc)
+    return None
+
+
 def import_zulip_sdk() -> Any:
     """Lazily import the real ``zulip`` SDK, bypassing this plugin's shadow.
 
@@ -286,10 +346,8 @@ def import_zulip_sdk() -> Any:
         importlib.invalidate_caches()
         sdk = importlib.import_module("zulip")
     except Exception as exc:  # fork: ImportError *and* broken installs
-        logger.error("zulip SDK import failed (%s): %s", sys.executable, exc)
-        zulip = None
-        ZULIP_AVAILABLE = False
-        return None
+        sdk = None
+        first_error = exc
     finally:
         # Put every entry back at its original index, then restore the package
         # binding other importers expect. sys.path ordering is import
@@ -298,6 +356,22 @@ def import_zulip_sdk() -> Any:
             sys.path.insert(index, entry)
         if shadowed is not None:
             sys.modules["zulip"] = shadowed
+
+    if sdk is None:
+        # Fork (live 2026-10-11): the Hermes gateway bootstrap replaces the
+        # interpreter's site-packages on sys.path with an environment venv that
+        # does not carry the SDK, while the SDK is installed in the bundled
+        # runtime itself. Load it straight from that file instead of reporting
+        # it missing.
+        sdk = _load_sdk_from_runtime()
+        if sdk is None:
+            logger.error(
+                "zulip package not installed for %s (%s). Run: pip install zulip",
+                sys.executable, first_error,
+            )
+            zulip = None
+            ZULIP_AVAILABLE = False
+            return None
 
     if _resolved_to_this_package(sdk):
         # Shadow removal did not take (the plugin is still reachable, e.g. via
