@@ -131,6 +131,12 @@ optional_env:
   - name: ZULIP_HOME_CHANNEL
     description: "Default stream id for cron `deliver: zulip` targets (e.g. 573423)"
     prompt: "Default cron stream id"
+  - name: ZULIP_HOME_CHANNEL_NAME
+    description: "Display name for the home channel used in gateway notifications (default: Home)"
+    prompt: "Home channel display name"
+  - name: ZULIP_HOME_CHANNEL_THREAD_ID
+    description: "Optional topic/thread for home-channel notifications"
+    prompt: "Home channel topic (optional)"
   - name: ZULIP_MAX_MESSAGE_LENGTH
     description: "Hard cap on a single outbound message in characters, 0 disables (default: 20000)"
     prompt: "Max outbound message length"

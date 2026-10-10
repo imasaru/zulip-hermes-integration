@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 import time
 import weakref
@@ -221,7 +222,7 @@ def _get_cached_client(site: str, email: str, api_key: str, *, _zulip_mod: Any =
 
     _zulip = _zulip_mod or _import_zulip_sdk()
     if _zulip is None:
-        raise ImportError("zulip package not installed")
+        raise ImportError("zulip package not installed. Run: pip install zulip")
 
     client = _zulip.Client(email=email, api_key=api_key, site=site)
 
@@ -291,6 +292,12 @@ def _parse_target(chat_id: str) -> dict[str, Any]:
     if cached is not None:
         return cached
 
+    original_chat_id = chat_id
+    if chat_id.startswith("dm_user:"):
+        # Legacy DM address still stored in home channels and cron delivery
+        # targets (e.g. ``zulip:dm_user:428945``). Same meaning as ``dm:``.
+        chat_id = "dm:" + chat_id[len("dm_user:"):]
+
     if chat_id.startswith("dm:"):
         # Session-scoped DM chat_ids include a `:session:N` suffix (e.g.
         # `dm:1032616:session:1`). Strip everything after the recipient list
@@ -321,7 +328,7 @@ def _parse_target(chat_id: str) -> dict[str, Any]:
         except ValueError:
             raise ValueError(f"Invalid Zulip target {chat_id!r}: expected a numeric stream id or 'dm:<user_id>'")
 
-    _set_cached_target(chat_id, info)
+    _set_cached_target(original_chat_id, info)
     return info
 
 
@@ -377,108 +384,117 @@ def _clear_caches() -> None:
 ZULIP_AVAILABLE = False
 
 
-def _import_zulip_sdk():
-    """Lazy-import the zulip SDK, bypassing plugin shadow if needed.
+def _is_zulip_sdk(mod: Any) -> bool:
+    """True when *mod* is the python-zulip-api SDK, not this plugin package."""
+    if mod is None or not hasattr(mod, "Client"):
+        return False
+    origin = os.path.abspath(getattr(mod, "__file__", "") or "")
+    return not origin.startswith(os.path.dirname(os.path.abspath(__file__)) + os.sep)
 
-    Hermes adds ~/.hermes/plugins/ (or the profile's plugins dir) to
-    sys.path, so a directory named 'zulip' shadows the pip-installed
-    zulip package.
 
-    Robust version:
-    - Dynamic discovery (no hardcoded version strings)
-    - Clears prior zulip entries from sys.modules
-    - Temporarily sanitizes sys.path to remove shadowing entries
-    - Prepends the real site-packages
-    - Performs a normal "import zulip"
-    - Always restores sys.path
-    - Explicit logging of discovery, existence, and exceptions
-    - Graceful fallback + correct global updates
+def _find_zulip_sdk_init() -> Optional[str]:
+    """Locate the SDK's ``zulip/__init__.py`` without being fooled by this plugin.
+
+    Hermes puts the plugins directory on ``sys.path``, so a plain
+    ``import zulip`` can resolve to *this* plugin package. Every ``sys.path``
+    entry except the plugin's parent directory is searched, then the
+    Hermes-bundled runtime's site-packages as a last resort (cron may run
+    under a different interpreter). Only a file that defines ``class Client``
+    is accepted.
     """
-    import sys
-    import os
-    import logging
+    plugin_dir = os.path.dirname(os.path.abspath(__file__))
+    plugin_parent = os.path.dirname(plugin_dir)
+    candidates: list[str] = []
+    for entry in list(sys.path):
+        base = os.path.abspath(entry or os.getcwd())
+        if base == plugin_parent:
+            continue
+        candidates.append(os.path.join(base, "zulip", "__init__.py"))
+    py_root = os.path.dirname(os.path.dirname(sys.executable or ""))
+    lib_dir = os.path.join(py_root, "lib")
+    if os.path.isdir(lib_dir):
+        for entry in sorted(os.listdir(lib_dir)):
+            if entry.startswith("python"):
+                candidates.append(
+                    os.path.join(lib_dir, entry, "site-packages", "zulip", "__init__.py")
+                )
+    for candidate in candidates:
+        if not os.path.isfile(candidate):
+            continue
+        if os.path.dirname(os.path.abspath(candidate)) == plugin_dir:
+            continue
+        try:
+            with open(candidate, encoding="utf-8", errors="ignore") as fh:
+                if "class Client" in fh.read():
+                    return candidate
+        except OSError:
+            continue
+    return None
+
+
+def _import_zulip_sdk():
+    """Import the python-zulip-api SDK once per process, never the plugin itself.
+
+    Returns the SDK module, or ``None`` only when the SDK genuinely cannot be
+    found or imported (callers then raise "zulip package not installed").
+    Never raises, never mutates ``sys.path``, and never evicts this plugin's
+    own modules from ``sys.modules``: the SDK is loaded straight from its file
+    (it has no intra-package imports), under the name ``zulip`` when that name
+    is free and a private alias otherwise.
+    """
+    import importlib.util
 
     global ZULIP_AVAILABLE, zulip
 
-    logger = logging.getLogger(__name__)
-
-    # 1. Cache check
     if ZULIP_AVAILABLE and zulip is not None:
         return zulip
 
-    # 2. Derive site-packages from the running Python executable
-    # This avoids walking/glob entirely and works regardless of sys.path state.
-    _sdk_path = None
-    _exe = sys.executable
-    if "hermes/tools/python" in _exe:
-        # .../python-xxx/bin/python3 -> .../python-xxx/lib/pythonX.Y/site-packages
-        _py_root = os.path.dirname(os.path.dirname(_exe))
-        _lib_dir = os.path.join(_py_root, "lib")
-        if os.path.isdir(_lib_dir):
-            for _entry in os.listdir(_lib_dir):
-                if _entry.startswith("python"):
-                    _sp = os.path.join(_lib_dir, _entry, "site-packages", "zulip", "__init__.py")
-                    if os.path.isfile(_sp):
-                        _sdk_path = _sp
-                        break
-
-    if not _sdk_path:
-        logger.error(
-            "zulip: SDK not found at derived path from %s",
-            _exe,
-        )
-        zulip = None
-        ZULIP_AVAILABLE = False
-        return None
-
-    site_packages_dir = os.path.dirname(os.path.dirname(_sdk_path))
-
-    logger.debug(
-        "zulip: discovered SDK init.py at %s (site-packages=%s, exists=%s)",
-        _sdk_path,
-        site_packages_dir,
-        os.path.isfile(_sdk_path),
-    )
-
-    if not os.path.isfile(_sdk_path):
-        logger.error("zulip: discovered path is not a file: %s", _sdk_path)
-        zulip = None
-        ZULIP_AVAILABLE = False
-        return None
-
-    # 3. Clear any prior "zulip" entries from sys.modules
-    _to_clear = [k for k in list(sys.modules.keys()) if k == "zulip" or k.startswith("zulip.")]
-    for _k in _to_clear:
-        sys.modules.pop(_k, None)
-
-    # 4. Prepend the real site-packages so normal import works
-    sys.path.insert(0, site_packages_dir)
-
-    try:
-        # 5 (cont). Normal import zulip (now that shadowing is removed and real path is first)
-        import zulip as _zulip_mod  # type: ignore
-
-        zulip = _zulip_mod
+    existing = sys.modules.get("zulip")
+    if _is_zulip_sdk(existing):
+        zulip = existing
         ZULIP_AVAILABLE = True
-        logger.info("zulip: successfully loaded SDK from %s", _sdk_path)
         return zulip
 
-    except Exception as _e:
+    sdk_init = _find_zulip_sdk_init()
+    if sdk_init is None:
         logger.error(
-            "zulip: import failed after sanitizing path (discovered=%s, site-packages=%s): %s",
-            discovered_path,
-            site_packages_dir,
-            _e,
-            exc_info=True,
+            "zulip package not installed (python-zulip-api not found for %s). "
+            "Run: pip install zulip",
+            sys.executable,
         )
         zulip = None
         ZULIP_AVAILABLE = False
-        sys.modules.pop("zulip", None)
         return None
 
-    finally:
-        # 6. Always restore sys.path
-        sys.path[:] = original_path
+    name = "zulip" if "zulip" not in sys.modules else "_hermes_zulip_sdk"
+    try:
+        spec = importlib.util.spec_from_file_location(
+            name, sdk_init, submodule_search_locations=[os.path.dirname(sdk_init)]
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot build an import spec for {sdk_init}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+        if not hasattr(module, "Client"):
+            sys.modules.pop(name, None)
+            raise ImportError(f"{sdk_init} does not provide zulip.Client")
+    except Exception as exc:
+        logger.error(
+            "zulip: SDK import failed (path=%s): %s", sdk_init, exc, exc_info=True
+        )
+        zulip = None
+        ZULIP_AVAILABLE = False
+        return None
+
+    zulip = module
+    ZULIP_AVAILABLE = True
+    logger.info("zulip: successfully loaded SDK from %s", sdk_init)
+    return zulip
 
 
 # Chunking defaults (overridable via env)
@@ -624,6 +640,12 @@ def _resolve_stream_overrides() -> dict[str, dict[str, Any]]:
     logged and ignored rather than raised.
     """
     raw = runtime_scope.get_setting("ZULIP_STREAM_OVERRIDES", "").strip()
+
+    def _remember(value: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        global _stream_overrides_cache
+        _stream_overrides_cache = (raw, value)
+        return value
+
     if len(raw.encode("utf-8")) > _MAX_JSON_OVERRIDES_BYTES:
         logger.warning(
             "ZULIP_STREAM_OVERRIDES exceeds max size (%d > %d bytes); ignoring overrides",
@@ -634,11 +656,6 @@ def _resolve_stream_overrides() -> dict[str, dict[str, Any]]:
     cached_raw, cached = _stream_overrides_cache
     if raw == cached_raw:
         return cached
-
-    def _remember(value: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        global _stream_overrides_cache
-        _stream_overrides_cache = (raw, value)
-        return value
 
     if not raw:
         return _remember({})
@@ -1083,6 +1100,16 @@ class ZulipAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("zulip"))
         extra = config.extra or {}
+        # Remember the profile secret scope active at construction so unscoped
+        # core-initiated sends can re-enter it (see _enter_owner_scope).
+        try:
+            from agent import secret_scope as _ss
+            self._owner_secret_scope = (
+                _ss.current_secret_scope(),
+                _ss.current_secret_scope_home(),
+            )
+        except Exception:
+            self._owner_secret_scope = None
 
         self.api_key = runtime_scope.get_setting("ZULIP_API_KEY") or extra.get("api_key", "")
         self.email = runtime_scope.get_setting("ZULIP_EMAIL") or extra.get("email", "")
@@ -1151,14 +1178,6 @@ class ZulipAdapter(BasePlatformAdapter):
         # Block streaming config (Issue #49 — requires gateway-level streaming support)
         self._block_streaming = (
             runtime_scope.get_setting("ZULIP_BLOCK_STREAMING", "").strip().lower() in ("true", "1", "yes", "on")
-        )
-
-        # Soft gate: when True, always dispatch stream messages to the LLM
-        # (like onmessage) but pass `addressed=False` in metadata for
-        # non-mentioned messages so the model can decide relevance.
-        # Matches LINE_SOFT_GATE behavior.
-        self._soft_gate = (
-            os.getenv("ZULIP_SOFT_GATE", "").strip().lower() in ("true", "1", "yes", "on")
         )
 
         self._data_dir = runtime_scope.get_profile_data_dir()
@@ -1261,7 +1280,7 @@ class ZulipAdapter(BasePlatformAdapter):
         self._presence_task: Optional[asyncio.Task] = None
 
         # Display name cache (Issue #47 — group message attribution)
-        self._display_names: Dict[str, str] = {}  # user_id → display_name
+        self._legacy_display_names: Dict[str, str] = {}  # user_id → display_name
         self._display_names_loaded = False
         self._load_display_names()
 
@@ -1327,15 +1346,15 @@ class ZulipAdapter(BasePlatformAdapter):
             dn = data.get("display_names") or {}
             if isinstance(dn, dict):
                 for k, v in dn.items():
-                    self._display_names[str(k)] = str(v)
+                    self._legacy_display_names[str(k)] = str(v)
             self._display_names_loaded = True
-            logger.debug("Zulip: loaded %d display names from %s", len(self._display_names), path)
+            logger.debug("Zulip: loaded %d display names from %s", len(self._legacy_display_names), path)
         except Exception as exc:
             logger.debug("Zulip: failed to load display names cache %s: %s", path, exc)
 
     def _save_display_names(self) -> None:
         """Persist the current display name cache (atomic write)."""
-        if not self._display_names:
+        if not self._legacy_display_names:
             return
         path = self._get_display_names_path()
         try:
@@ -1346,7 +1365,7 @@ class ZulipAdapter(BasePlatformAdapter):
                     existing = json.loads(path.read_text(encoding="utf-8")) or {}
                 except Exception:
                     existing = {}
-            merged_dn = {**(existing.get("display_names") or {}), **self._display_names}
+            merged_dn = {**(existing.get("display_names") or {}), **self._legacy_display_names}
             if not merged_dn:
                 return
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1362,7 +1381,7 @@ class ZulipAdapter(BasePlatformAdapter):
         Uses the Zulip SDK get_user endpoint. Results are cached in-memory
         and persisted to disk so they survive restarts.
         """
-        if sender_id in self._display_names:
+        if sender_id in self._legacy_display_names:
             return  # already cached
         try:
             user = await self._sdk_call(
@@ -1371,14 +1390,14 @@ class ZulipAdapter(BasePlatformAdapter):
                 timeout=self._connect_timeout,
             )
             if user and user.get("full_name"):
-                self._display_names[sender_id] = user["full_name"]
+                self._legacy_display_names[sender_id] = user["full_name"]
                 self._save_display_names()
         except Exception as exc:
             logger.debug("Zulip: failed to fetch display name for %s: %s", sender_id, exc)
 
     def _get_display_name(self, sender_id: str) -> str:
         """Return the cached display name for a user, or empty string."""
-        return self._display_names.get(sender_id, "")
+        return self._legacy_display_names.get(sender_id, "")
 
     async def _sdk_call(self, fn, *args, timeout: float, **kwargs):
         """Wrap a synchronous SDK call in asyncio.to_thread + asyncio.wait_for.
@@ -2133,92 +2152,6 @@ class ZulipAdapter(BasePlatformAdapter):
     # Stream/group message observation (observe-then-decide, matching LINE)
     # ------------------------------------------------------------------
 
-    def _observe_stream_message(self, message: dict) -> None:
-        """Write a stream message into the session transcript without triggering the agent.
-
-        This allows the model to see the full stream conversation when it is
-        eventually invoked via @bot or onchar. Messages are stored with
-        ``role: "user"`` using the sender's full name for attribution (consistent
-        with how source.user_name is used). The entry is tagged ``"observed": True``.
-
-        Does NOT trigger handle_message / LLM dispatch.
-        """
-        if not getattr(self, "_observe_group", False):
-            return
-        store = getattr(self, "_session_store", None)
-        if not store:
-            return
-        try:
-            if message.get("type") != "stream":
-                return
-            # Already filtered self by email earlier, but be defensive
-            if message.get("sender_email") == getattr(self, "email", None):
-                return
-
-            content = strip_html_to_text(message.get("content", "") or "")
-            content = strip_think_blocks(content)
-            message_id = str(message.get("id", ""))
-            sender_email = message.get("sender_email", "")
-            sender_full_name = message.get("sender_full_name", "Unknown") or "Unknown"
-            sender_id = str(message.get("sender_id", ""))
-            stream_id = message.get("stream_id")
-            topic = (message.get("subject") or "").strip()
-            stream_name = message.get("display_recipient", str(stream_id) if stream_id is not None else "unknown")
-
-            chat_id = str(stream_id) if stream_id is not None else ""
-
-            # Match processing path for per-topic session keys
-            use_thread = bool(topic and _topic_sessions_enabled())
-
-            # Use cached display name if available (updated by _ensure_display_name)
-            display_name = self._get_display_name(sender_id) or sender_full_name
-
-            from gateway.session import SessionSource
-            from gateway.config import Platform
-
-            source_kwargs: dict[str, Any] = {
-                "chat_id": chat_id,
-                "chat_name": stream_name,
-                "chat_type": "thread" if use_thread else "stream",
-                "user_id": sender_email,
-                "user_name": display_name,
-            }
-            if use_thread:
-                source_kwargs["thread_id"] = topic
-
-            source = SessionSource(
-                platform=Platform("zulip"),
-                **source_kwargs,
-            )
-
-            # Simple attribution (expand later with bridged/display cache if added)
-            attributed = f"[{display_name}]\n{content}"
-
-            entry: dict = {
-                "role": "user",
-                "content": attributed,
-                "timestamp": __import__("datetime").datetime.now(
-                    tz=__import__("datetime").timezone.utc
-                ).isoformat(),
-                "observed": True,
-            }
-            if message_id:
-                entry["message_id"] = message_id
-
-            session_entry = store.get_or_create_session(source)
-            store.append_to_transcript(
-                session_entry.session_id,
-                entry,
-            )
-            logger.debug(
-                "zulip observed stream msg [stream=%s topic=%s sender=%s]",
-                mask_pii(stream_name),
-                mask_pii(topic),
-                mask_pii(sender_email),
-            )
-        except Exception as exc:
-            logger.warning("zulip: Failed to observe stream message: %s", exc)
-
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Initialize connection and start listening."""
         logger.info("Zulip adapter connecting...")
@@ -2373,7 +2306,7 @@ class ZulipAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         """Get information about a chat/channel."""
-        if chat_id.startswith("dm:"):
+        if chat_id.startswith(("dm:", "dm_user:")):
             return {"name": chat_id, "type": "dm"}
         return {"name": chat_id, "type": "stream"}
 
@@ -4193,6 +4126,27 @@ class ZulipAdapter(BasePlatformAdapter):
             )
             return text
 
+    def _enter_owner_scope(self):
+        """Re-install this adapter's profile secret scope for an unscoped call.
+
+        Under a multiplexed gateway, core-initiated calls (final replies after
+        the turn scope closed, home-channel notices, typing/processing hooks)
+        can reach the adapter with no
+        profile scope bound, so runtime_scope.get_setting() raises
+        UnscopedSecretError and the reply is lost. Returns a reset token, or
+        None when nothing was installed. (local fix 2026-10-10)
+        """
+        try:
+            if not runtime_scope.is_unscoped_multiplexer():
+                return None
+            owner = getattr(self, "_owner_secret_scope", None)
+            if not owner or owner[0] is None:
+                return None
+            from agent import secret_scope as _ss
+            return _ss.set_secret_scope(owner[0], profile_home=owner[1])
+        except Exception:
+            return None
+
     async def send(
         self,
         chat_id: str,
@@ -4377,6 +4331,53 @@ class ZulipAdapter(BasePlatformAdapter):
             return SendResult(success=False, message_id="")
 
 
+
+# ---------------------------------------------------------------------------
+# Profile scope for core-invoked hooks (local fix 2026-10-10)
+# ---------------------------------------------------------------------------
+# Under gateway.multiplex_profiles the host calls these hooks from contexts
+# where no profile secret scope is bound (e.g. the final reply after the turn
+# scope closed, startup home-channel notices, typing keep-alives). Their code
+# paths read settings via runtime_scope.get_setting(), which fails closed with
+# UnscopedSecretError there, and the user never gets the reply. Each hook
+# re-enters the adapter's own profile scope for its duration only.
+def _owner_scoped(fn):
+    import functools
+
+    @functools.wraps(fn)
+    async def _wrapper(self, *args, **kwargs):
+        token = self._enter_owner_scope()
+        try:
+            return await fn(self, *args, **kwargs)
+        finally:
+            if token is not None:
+                from agent import secret_scope as _ss
+
+                _ss.reset_secret_scope(token)
+
+    _wrapper.__wrapped_owner_scoped__ = True
+    return _wrapper
+
+
+_OWNER_SCOPED_HOOKS = (
+    "send",
+    "send_typing",
+    "stop_typing",
+    "send_image_file",
+    "send_document",
+    "on_processing_start",
+    "on_processing_complete",
+    "delete_message",
+    "get_chat_info",
+)
+for _hook in _OWNER_SCOPED_HOOKS:
+    _fn = ZulipAdapter.__dict__.get(_hook)
+    if _fn is not None and not getattr(_fn, "__wrapped_owner_scoped__", False):
+        setattr(ZulipAdapter, _hook, _owner_scoped(_fn))
+del _hook, _fn
+
+
+
 def check_requirements() -> bool:
     """Return True if the zulip SDK is installed."""
     return _import_zulip_sdk() is not None
@@ -4403,12 +4404,12 @@ def _env_enablement() -> dict | None:
     extra: dict = {"api_key": key, "email": email, "site": site}
 
     # Home channel: gateway restart/startup notifications destination.
-    home_channel = os.getenv("ZULIP_HOME_CHANNEL", "").strip()
+    home_channel = runtime_scope.get_setting("ZULIP_HOME_CHANNEL", "").strip()
     if home_channel:
         extra["home_channel"] = {
             "chat_id": home_channel,
-            "name": os.getenv("ZULIP_HOME_CHANNEL_NAME", "Home").strip() or "Home",
-            "thread_id": os.getenv("ZULIP_HOME_CHANNEL_THREAD_ID", "").strip() or None,
+            "name": runtime_scope.get_setting("ZULIP_HOME_CHANNEL_NAME", "Home").strip() or "Home",
+            "thread_id": runtime_scope.get_setting("ZULIP_HOME_CHANNEL_THREAD_ID", "").strip() or None,
         }
 
     return extra
