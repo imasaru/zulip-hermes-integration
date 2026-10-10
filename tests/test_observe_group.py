@@ -207,12 +207,20 @@ class TestSoftGate:
 
     @pytest.mark.asyncio
     async def test_dm_dispatch_is_unchanged_by_soft_gate(self, make_adapter):
+        """A DM is dispatched exactly as without the soft gate.
+
+        Fork deviation from upstream (which expects no ``addressed`` key on DMs):
+        the fork always marks a DM ``addressed=True`` -- a direct message to the
+        bot is by definition addressed to it, so the agent must answer it and
+        never treat it as an overheard/observe-only message. The soft gate must
+        not change that, so the flag is True with the gate on as well.
+        """
         adapter = make_adapter(ZULIP_CHATMODE="oncall", ZULIP_SOFT_GATE="true")
         await adapter._handle_message(_dm_msg("hi in a dm"))
         adapter.handle_message.assert_called_once()
         event = adapter.handle_message.call_args[0][0]
         assert event.source.chat_type == "dm"
-        assert "addressed" not in event.metadata
+        assert event.metadata["addressed"] is True
 
 
 class TestObserveGroup:
