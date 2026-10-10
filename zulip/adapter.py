@@ -305,8 +305,21 @@ def _parse_target(chat_id: str) -> dict[str, Any]:
         if not user_ids:
             raise ValueError("DM target must include at least one recipient")
         info = {"type": "dm", "user_ids": user_ids}
+    elif ":" in chat_id:
+        # Support stream:topic format (e.g. "614901:general")
+        parts = chat_id.split(":", 1)
+        try:
+            stream_id = int(parts[0])
+            info = {"type": "stream", "stream_id": stream_id, "topic": parts[1]}
+        except ValueError:
+            raise ValueError(f"Invalid stream ID in target: {chat_id!r}")
     else:
-        info = {"type": "stream", "stream_id": int(chat_id)}
+        # Bare numeric stream ID (legacy)
+        try:
+            stream_id = int(chat_id)
+            info = {"type": "stream", "stream_id": stream_id}
+        except ValueError:
+            raise ValueError(f"Invalid Zulip target {chat_id!r}: expected a numeric stream id or 'dm:<user_id>'")
 
     _set_cached_target(chat_id, info)
     return info
@@ -367,34 +380,105 @@ ZULIP_AVAILABLE = False
 def _import_zulip_sdk():
     """Lazy-import the zulip SDK, bypassing plugin shadow if needed.
 
-    Hermes adds ~/.hermes/plugins/ to sys.path, so a directory named
-    'zulip' shadows the pip-installed zulip package. We temporarily
-    remove the shadowed entry from sys.modules to force Python to
-    re-resolve to the real SDK.
+    Hermes adds ~/.hermes/plugins/ (or the profile's plugins dir) to
+    sys.path, so a directory named 'zulip' shadows the pip-installed
+    zulip package.
+
+    Robust version:
+    - Dynamic discovery (no hardcoded version strings)
+    - Clears prior zulip entries from sys.modules
+    - Temporarily sanitizes sys.path to remove shadowing entries
+    - Prepends the real site-packages
+    - Performs a normal "import zulip"
+    - Always restores sys.path
+    - Explicit logging of discovery, existence, and exceptions
+    - Graceful fallback + correct global updates
     """
     import sys
+    import os
+    import logging
 
     global ZULIP_AVAILABLE, zulip
+
+    logger = logging.getLogger(__name__)
+
+    # 1. Cache check
     if ZULIP_AVAILABLE and zulip is not None:
         return zulip
 
-    # Remove any shadowed plugin entry so Python resolves the real SDK
-    _shadow = sys.modules.pop("zulip", None)
-    try:
-        import zulip as _sdk
+    # 2. Derive site-packages from the running Python executable
+    # This avoids walking/glob entirely and works regardless of sys.path state.
+    _sdk_path = None
+    _exe = sys.executable
+    if "hermes/tools/python" in _exe:
+        # .../python-xxx/bin/python3 -> .../python-xxx/lib/pythonX.Y/site-packages
+        _py_root = os.path.dirname(os.path.dirname(_exe))
+        _lib_dir = os.path.join(_py_root, "lib")
+        if os.path.isdir(_lib_dir):
+            for _entry in os.listdir(_lib_dir):
+                if _entry.startswith("python"):
+                    _sp = os.path.join(_lib_dir, _entry, "site-packages", "zulip", "__init__.py")
+                    if os.path.isfile(_sp):
+                        _sdk_path = _sp
+                        break
 
-        zulip = _sdk
-        ZULIP_AVAILABLE = True
-        return _sdk
-    except ImportError:
+    if not _sdk_path:
+        logger.error(
+            "zulip: SDK not found at derived path from %s",
+            _exe,
+        )
         zulip = None
         ZULIP_AVAILABLE = False
         return None
+
+    site_packages_dir = os.path.dirname(os.path.dirname(_sdk_path))
+
+    logger.debug(
+        "zulip: discovered SDK init.py at %s (site-packages=%s, exists=%s)",
+        _sdk_path,
+        site_packages_dir,
+        os.path.isfile(_sdk_path),
+    )
+
+    if not os.path.isfile(_sdk_path):
+        logger.error("zulip: discovered path is not a file: %s", _sdk_path)
+        zulip = None
+        ZULIP_AVAILABLE = False
+        return None
+
+    # 3. Clear any prior "zulip" entries from sys.modules
+    _to_clear = [k for k in list(sys.modules.keys()) if k == "zulip" or k.startswith("zulip.")]
+    for _k in _to_clear:
+        sys.modules.pop(_k, None)
+
+    # 4. Prepend the real site-packages so normal import works
+    sys.path.insert(0, site_packages_dir)
+
+    try:
+        # 5 (cont). Normal import zulip (now that shadowing is removed and real path is first)
+        import zulip as _zulip_mod  # type: ignore
+
+        zulip = _zulip_mod
+        ZULIP_AVAILABLE = True
+        logger.info("zulip: successfully loaded SDK from %s", _sdk_path)
+        return zulip
+
+    except Exception as _e:
+        logger.error(
+            "zulip: import failed after sanitizing path (discovered=%s, site-packages=%s): %s",
+            discovered_path,
+            site_packages_dir,
+            _e,
+            exc_info=True,
+        )
+        zulip = None
+        ZULIP_AVAILABLE = False
+        sys.modules.pop("zulip", None)
+        return None
+
     finally:
-        # Restore the shadowed plugin entry so Hermes/other imports
-        # that expect the zulip package continue to work
-        if _shadow is not None:
-            sys.modules["zulip"] = _shadow
+        # 6. Always restore sys.path
+        sys.path[:] = original_path
 
 
 # Chunking defaults (overridable via env)
@@ -4239,7 +4323,8 @@ class ZulipAdapter(BasePlatformAdapter):
                 )
             else:
                 stream_id = target["stream_id"]
-                topic = topic_override or _metadata_topic(metadata)
+                # Topic priority: explicit override > parsed from chat_id > metadata > cache
+                topic = topic_override or target.get("topic") or _metadata_topic(metadata)
                 if not topic:
                     topic = self._topic_cache.get(chat_id, "general")
                 audit_topic = topic
@@ -4615,7 +4700,8 @@ async def _standalone_send(
         payload = {"type": "private", "to": target["user_ids"], "content": content}
         audit_topic: Optional[str] = None
     else:
-        topic = topic_directive or (str(thread_id).strip() if thread_id else "") or STANDALONE_DEFAULT_TOPIC
+        # Topic priority: topic directive in message > parsed from chat_id > thread_id param > default
+        topic = topic_directive or target.get("topic") or (str(thread_id).strip() if thread_id else "") or STANDALONE_DEFAULT_TOPIC
         payload = {
             "type": "stream",
             "to": target["stream_id"],

@@ -73,16 +73,38 @@ class TraceConfig:
         if env is None:
             # Resolve through the active Hermes profile so trace settings cannot
             # leak across profiles under multiplexing (#156).
-            env = {
-                key: runtime_scope.get_setting(key)
-                for key in (
-                    "ZULIP_ACTIVITY_TRACE",
-                    "ZULIP_TRACE_COALESCE_MS",
-                    "ZULIP_TRACE_MAX_RATE",
-                    "ZULIP_TRACE_MAX_CONTENT",
-                    "ZULIP_TRACE_TOOL_MATCHER",
-                )
-            }
+            #
+            # During plugin load time (before _profile_runtime_scope installs
+            # set_secret_scope), runtime_scope.get_setting() would raise
+            # UnscopedSecretError because multiplex is active but no scope is
+            # installed.  Fall back to os.getenv for non-credential settings
+            # so the adapter can still construct.  Credentials (API key, email,
+            # site) are resolved later in the adapter's own __init__ inside
+            # the proper scope.
+            try:
+                env = {
+                    key: runtime_scope.get_setting(key)
+                    for key in (
+                        "ZULIP_ACTIVITY_TRACE",
+                        "ZULIP_TRACE_COALESCE_MS",
+                        "ZULIP_TRACE_MAX_RATE",
+                        "ZULIP_TRACE_MAX_CONTENT",
+                        "ZULIP_TRACE_TOOL_MATCHER",
+                    )
+                }
+            except Exception:
+                # Fallback to process environment when no profile scope is
+                # installed yet (plugin-load-time).
+                env = {
+                    key: os.environ.get(key, "")
+                    for key in (
+                        "ZULIP_ACTIVITY_TRACE",
+                        "ZULIP_TRACE_COALESCE_MS",
+                        "ZULIP_TRACE_MAX_RATE",
+                        "ZULIP_TRACE_MAX_CONTENT",
+                        "ZULIP_TRACE_TOOL_MATCHER",
+                    )
+                }
 
         def _num(key: str, default: float, cast: Callable[[str], Any]) -> Any:
             try:
