@@ -20,7 +20,7 @@ please report either as a security issue.
 
 | Component | Supported version |
 |-----------|-------------------|
-| Plugin | `1.10.1` — the current release; security fixes land on the latest release and `main` (`zulip/version.py::__version__`, `__repo__`) |
+| Plugin | `1.12.0` — the current release; security fixes land on the latest release and `main` (`zulip/version.py::__version__`, `__repo__`) |
 | Hermes gateway | `>= 0.18.2` (`zulip/version.py::__min_hermes__`) |
 
 Security patches are applied to the latest release only. Older plugin versions are
@@ -106,15 +106,13 @@ platform config/extra**:
 self.api_key = os.getenv("ZULIP_API_KEY") or extra.get("api_key", "")
 ```
 
-(`zulip/adapter.py::ZulipAdapter.__init__`; same precedence in
-`zulip/accounts.py::AccountResolver._single_account`.) Put the API key in the
+(`zulip/adapter.py::ZulipAdapter.__init__`.) Put the API key in the
 environment, not a config file, so an agent that reads config files does not
 automatically read the key as well.
 
-`zulip/accounts.py::AccountResolver` can parse a multi-account `accounts:` map,
-but **the adapter itself is single-account** — it reads one `api_key`/`email`/
-`site` at construction and the resolver is not wired into `register()`. Treat
-multi-account as unshipped.
+**Multi-account is not supported.** The adapter is single-account: it reads one
+`api_key`/`email`/`site` at construction, and `plugin.yaml` exposes no
+`accounts:` option, so there is no way to configure more than one.
 
 ### Transmission
 
@@ -322,6 +320,9 @@ Events are written as JSON lines by `zulip/audit_logger.py`.
 | `secret_leak_blocked` | Outbound message refused for containing a host credential | `zulip/adapter.py::ZulipAdapter._refuse_secret_leak`, `_standalone_send` |
 | `media_upload_blocked` | An upload was refused by the name-based denylist | `zulip/media.py::_audit_refused_upload` |
 | `activity_trace_recovered` | An interrupted trace message was finalized after restart | `zulip/adapter.py` (trace recovery path) |
+| `dispatch_turn`, `deliver_payload`, `deliver_skipped`, `deliver_empty`, `deliver_failed` | Whether a reply was dispatched and what became of it (Issue #145) | `zulip/inbound_queue.py::SessionQueueController._dispatch_turn`, `zulip/outbound.py` |
+| `approval_outcome` | An exec approval resolved: the choice, the decider (`timeout` / `policy` / a masked address) and the request id minted for the prompt | `zulip/adapter.py::ZulipAdapter.report_approval_outcome` |
+| `approval_rejected` | A decision was refused because the sender is not the bot owner, and was therefore not counted | `zulip/adapter.py::ZulipAdapter.reject_approval_decision` |
 
 **Defined but never emitted** (helpers exist, no call site — do not treat these
 as coverage): `monitor_start`, `monitor_stop`, `auth_failure`
@@ -330,10 +331,10 @@ as coverage): `monitor_start`, `monitor_stop`, `auth_failure`
 
 ### Gaps — what is *not* audited
 
-- **Delivery outcomes.** Whether a reply/upload actually reached Zulip is not
-  audited today; send failures surface on the process log only (tracked in
-  Issue #145). "No `secret_leak_blocked` line" therefore does **not** imply a
-  message was delivered.
+- **Delivery outcomes.** ``dispatch_turn`` and the ``deliver_*`` events pair up
+  (Issue #145), so "ran and had nothing to send" and "never ran" are
+  distinguishable — but they record only that a message was handed to Zulip,
+  not that a human saw it, and an upload's own success is not a separate event.
 - **Non-policy message drops.** Stream drops for "no trigger" (chatmode/mention
   gating), stream-filter misses, and self-message filtering are process-log
   `debug` lines, not audit events (`zulip/adapter.py::_handle_message`).
@@ -441,11 +442,61 @@ Issue #156.
 3. **Keep HTTPS.** Only set `ZULIP_ALLOW_INSECURE_HTTP=1` for a trusted,
    self-hosted realm, and understand it also permits private/localhost hosts.
 4. **Restrict DMs and streams.** Prefer `ZULIP_DM_POLICY=allowlist` or
-   `pairing`, and set `ZULIP_GROUP_POLICY`/`ZULIP_ALLOWED_USERS` rather than
-   leaving `open` — the default is permissive for backward compatibility.
+   `pairing`, and set `ZULIP_GROUP_POLICY=allowlist` together with
+   `ZULIP_GROUP_ALLOW_FROM`, rather than leaving `open` — the default is
+   permissive for backward compatibility. The two allowlists are **separate
+   and not interchangeable**: `ZULIP_ALLOWED_USERS` covers **DMs**, while
+   `ZULIP_GROUP_ALLOW_FROM` covers **streams**. Setting
+   `ZULIP_GROUP_POLICY=allowlist` while `ZULIP_GROUP_ALLOW_FROM` is empty
+   blocks *everyone* from triggering the bot in streams, and setting
+   `ZULIP_ALLOWED_USERS` alone leaves streams open to the whole realm.
 5. **Leave the secret guard on** (`ZULIP_BLOCK_SECRET_LEAKS` unset/true).
 6. **Tighten the data dir.** `chmod 700` `HERMES_DATA_DIR` so the `0600` state
    files and the umask-created audit log are not world-readable.
 7. **Set a rate limit** (`ZULIP_MAX_MESSAGES_PER_MINUTE`, default 60 per sender).
 8. **Review the audit log** at `{HERMES_DATA_DIR}/audit/` — and remember the
    [gaps](#gaps--what-is-not-audited) above when reading it.
+
+### `ZULIP_PROFILE=recommended` moves security-relevant defaults
+
+Setting the profile is a convenience posture, and it changes defaults that this
+file otherwise tells you to set by hand. Stated plainly, because an operator who
+sets it should know what they did not type:
+
+* `ZULIP_DM_POLICY` becomes `allowlist`, and the allowlist is seeded with the
+  **bot owner** resolved from Zulip (`ZulipAdapter.seed_bot_owner_dm_allowlist`,
+  `zulip/policy.py::PolicyEngine.seed_dm_allowlist`). If the owner cannot be
+  resolved, the allowlist stays **empty** — failing closed, so nobody can DM —
+  and one warning names `ZULIP_OWNER_EMAIL` as the fix.
+* `ZULIP_OBSERVE_GROUP` becomes on, so non-addressed stream messages are buffered
+  as topic context and quoted into a later prompt. The buffer is bounded
+  (`zulip/history.py::ObservedContextBuffer`) and, under this profile,
+  conversation-scoped — only topics the bot was addressed in are kept
+  (`zulip/history.py::AddressedTopicTracker`).
+* `ZULIP_ACTIVITY_TRACE` becomes on: one bot-owned status message per run, edited
+  in place.
+* `ZULIP_APPROVAL_AUTHORITY` becomes `owner`: only the **bot owner** may decide
+  an exec approval. A decision from anyone else is refused, stated in the topic
+  and audited (`approval_rejected`) — and **not counted**, so the prompt stays
+  open for the owner and the gateway's timeout still refuses an unanswered
+  request. The owner is the same identity the DM allowlist is seeded from, so
+  under this profile an unresolvable owner blocks **both** DMs and every
+  approval decision until `ZULIP_OWNER_EMAIL` is set
+  (`zulip/approval_outcomes.py::rejection_reason`,
+  `zulip/adapter.py::ZulipAdapter.gate_approval_decision`).
+* `ZULIP_APPROVAL_ON_TIMEOUT` becomes `deny`: an approval nobody answers is
+  stated in the prompt's topic and audited with `timeout` as the decider. The
+  **gateway** owns the approval timeout and refuses an unanswered request on
+  every supported host, so this key changes what the install says and records,
+  not what happens — no setting can make silence run a command
+  (`zulip/settings.py::resolve_approval_on_timeout`).
+
+**The stream posture does not move.** `ZULIP_GROUP_POLICY` stays `open`, so any
+realm member who can mention the bot can also trigger it in a stream — exactly as
+on an install with no profile. Setting the profile is **not** a substitute for
+item 4 above.
+
+An install **without** `ZULIP_PROFILE` is unaffected: the preset supplies a value
+only for a knob the operator did not set, and only while the marker is present
+(`zulip/runtime_scope.py::resolve_setting`). `tests/test_profile_gate.py` pins that
+contract, and `docs/RECOMMENDED-PROFILE.md` is the full spec.

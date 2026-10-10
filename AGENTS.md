@@ -38,7 +38,7 @@ Every `MessageEvent.metadata` contains:
     "conversation_turn": 12,        # int — cumulative messages in this chat
     "session_gap_seconds": 45.2,   # float — seconds since last message
     "topic_changed": False,         # bool — streams only
-    "addressed": True,             # bool — was this message aimed at you? (see below)
+    "addressed": True,             # bool — streams; present only under ZULIP_SOFT_GATE (see below)
 }
 ```
 
@@ -53,10 +53,14 @@ Every `MessageEvent.metadata` contains:
 
 **Example:** `conversation_turn=25, session_gap_seconds=12` → The user has been rapidly messaging. Avoid template recycling.
 
-**`addressed` is the important new one.** It is always present on streams. It is `True` when
-you were mentioned or a trigger prefix fired, and `False` when you are being shown traffic
-you were not asked to answer (only happens when the admin turns on `ZULIP_SOFT_GATE`). A
-stream message with `addressed=False` is *context*, not a request.
+**`addressed` is the important new one.** It is `True` when you were mentioned or a trigger
+prefix fired, and `False` when you are being shown traffic you were not asked to answer.
+
+It is present **only when the admin has turned on `ZULIP_SOFT_GATE`**. With the soft gate off,
+every stream message that reaches you is by definition addressed, and the key is omitted from
+the event metadata entirely (the metadata is byte-identical to before the soft gate existed —
+issue #153). So treat a *missing* `addressed` as "the soft gate is off", and a stream message
+with `addressed=False` as *context*, not a request.
 
 ---
 
@@ -93,6 +97,8 @@ Messages starting with `/` are intercepted **before** they reach you:
 | anything else starting with `/` | gateway / falls through | ✅ Yes (treat as normal message) |
 
 **Do not silently drop `/` messages.** The plugin handles only the four admin commands (`/streams`, `/user`, `/pin`, `/unpin`) and the sticky-engagement stops; gateway-native commands fall through to Hermes, which owns them. If a message isn't one of the commands above, it's a user question for you. The admin commands delegate to you — if a user asks you to manage streams or pin a message, use the adapter's `star_message()`, `list_streams()`, `get_user_info()` methods.
+
+**A slash command is never mention-gated.** In any chatmode, including `oncall` in a quiet topic, a `/`-message reaches the gateway: a command is not conversation, and the gateway owns slash authorization. This is what makes the exec-approval buttons work — a click sends an ordinary `/approve` or `/deny` from the clicker. The sender rate limit, the stream filter and the policy gates still apply to it (issue #259).
 
 ---
 
@@ -221,7 +227,11 @@ situation:
 
 | Behaviour | What changes for you | How to tell it's on |
 |-----------|---------------------|---------------------|
+| **Recommended profile** | Several rows below are on because the install set `ZULIP_PROFILE=recommended` — **not** because an admin configured each one: streams are mention-gated, DMs belong to the bot owner, and the trace, history, observation, session queue and reaction triggers are on | a value reports `profile` as its source rather than `env` |
 | **Sticky engagement** | Follow-ups arrive with no mention, in a topic you were already talking in | the message is `addressed` but has no @mention in it |
+| **Bot traffic never re-engages a topic** | Another bot's message in an engaged topic is neither answered nor counted — it cannot keep the window open | always on with sticky engagement; **not configurable**, so it cannot be re-enabled by accident |
+| **Unanswered approvals fail closed** | An exec approval nobody answers is refused (the gateway owns the timeout and refuses either way). `ZULIP_APPROVAL_ON_TIMEOUT=deny` makes the bot *say* so in the topic and record `timeout` as the decider; a person's `/deny` is confirmed by the gateway already. The recommended profile sets `deny` | `deny` in `zulip config`, or `ZULIP_PROFILE=recommended` |
+| **Owner-only approvals** | Only the bot owner may decide an exec approval: a coworker's `/approve` or `/deny` is refused, said so in the topic, audited, and never counted — the prompt stays open for the owner. With no owner resolvable, nobody may decide | `owner` in `zulip config`, or `ZULIP_PROFILE=recommended` |
 | **Per-session queue** | Your previous turn in this topic may still be running; the next message waited behind it | a run you didn't start can precede the message; don't assume a dropped request |
 | **Activity trace** | One status message in your topic is being edited live with your progress | `ZULIP_ACTIVITY_TRACE` is on (see below) |
 | **Observed stream traffic** | Non-addressed messages may appear quoted as `[Observed topic history …]` | the label is in your prompt |
@@ -230,6 +240,13 @@ situation:
 **If a request seems to have been ignored, it may have been queued rather than dropped** —
 the reply is coming, after the turn ahead of it finishes. Don't apologise for a message you
 haven't actually seen.
+
+**A preset-set behaviour is not an admin-configured one.** If the install runs with
+`ZULIP_PROFILE=recommended`, the mention-gating, the trace, the observation buffer and the
+reaction triggers were switched on by the *profile*, not by a person. Don't offer to "ask the
+admin to turn it off" — it is one line in `.env`, and `zulip config` says which layer supplied
+each value (`env` / `profile` / `default`). The contract is in
+[docs/RECOMMENDED-PROFILE.md](docs/RECOMMENDED-PROFILE.md).
 
 ---
 
@@ -246,6 +263,7 @@ edits as work proceeds, closed out when the run ends. It is **off by default**
 ## 📋 Quick Reference
 
 ### Do
+- ✅ Before changing anything under `zulip/`, read [CONTRIBUTING.md § Rules That Bite](CONTRIBUTING.md#rules-that-bite) — the defect classes that have bitten this repo, and which of them CI will **not** catch
 - ✅ Preserve topic for stream replies
 - ✅ Check `metadata.addressed` before deciding to stay silent
 - ✅ Reference previous context naturally
@@ -267,7 +285,9 @@ edits as work proceeds, closed out when the run ends. It is **off by default**
 
 | User says | Likely cause | What to tell them |
 |-----------|-------------|-------------------|
-| "Bot isn't responding" | Not subscribed to stream / wrong trigger mode | "Ask your admin to check if the bot is subscribed to this stream and verify the trigger mode." |
+| "Bot isn't responding" | Not subscribed to stream / wrong trigger mode / stream policy blocks the sender | "Ask your admin to check if the bot is subscribed to this stream, verify the trigger mode, and check `ZULIP_GROUP_POLICY` with `ZULIP_GROUP_ALLOW_FROM`." |
+| "The bot works in DMs but is silent in every stream" | `ZULIP_GROUP_POLICY=allowlist` with an **empty** `ZULIP_GROUP_ALLOW_FROM` — an empty allowlist blocks *everyone* | "Your admin must list who may trigger the bot in streams in `ZULIP_GROUP_ALLOW_FROM`. Note the stream allowlist is separate from `ZULIP_ALLOWED_USERS`, which only covers DMs." |
+| "Anyone in the org can trigger the bot in a stream" | `ZULIP_GROUP_POLICY` left at its `open` default, so the stream allowlist is ignored entirely | "Your admin can set `ZULIP_GROUP_POLICY=allowlist` and populate `ZULIP_GROUP_ALLOW_FROM` to restrict who may trigger the bot in streams." |
 | "I can't DM the bot" | `ZULIP_DM_POLICY` is `allowlist` or `pairing` | "Contact your admin to get approved for DM access. Under `pairing` you will get a `PAIR-…` code to share with them." |
 | "The bot replies to everything" | `ZULIP_CHATMODE=onmessage` with mention-gating off | "The admin can switch to `oncall` mode so the bot only responds to mentions." |
 | "Bot went quiet mid-conversation" | sticky-engagement window lapsed | "Mention the bot again to reopen the conversation in that topic." |
@@ -277,16 +297,27 @@ edits as work proceeds, closed out when the run ends. It is **off by default**
 
 ## 🔌 Gateway Compatibility
 
-| Hermes gateway | Native exec-approval buttons | Reply routing (`thread_id`) |
-|----------------|------------------------------|-----------------------------|
-| **≥ 0.21.3** | ✅ Clickable buttons — Allow Once / Allow Session / Always Allow / Deny | ✅ |
-| 0.21.0 – 0.21.2 | ➖ Falls back to plain-text `/approve` / `/deny` instructions | ✅ |
-| **0.18.2** (`__min_hermes__`) | ➖ Not available (import guarded) | ✅ |
-| < 0.18.2 | ❌ Unsupported | — |
+| Hermes gateway | Native exec-approval buttons | Reply routing (`thread_id`) | Typing cleared in the run's own topic |
+|----------------|------------------------------|-----------------------------|--------------------------------------|
+| **≥ 0.21.3** | ✅ Clickable buttons — Allow Once / Allow Session / Always Allow / Deny | ✅ | ✅ via `_stop_typing_with_metadata` + `_accepts_kwarg` |
+| **0.18.2 – 0.21.2** (`__min_hermes__`) | ➖ Not available (import guarded) — plain-text `/approve` / `/deny` | ✅ | ➖ Falls back to the stream's last-seen topic |
+| < 0.18.2 | ❌ Unsupported | — | — |
 
 Native buttons rely on the gateway's `_send_exec_approval_prompt` hook, imported defensively
 so older gateways still load. A real-host contract gate for these symbols lives in
-[scripts/check_compat.py](scripts/check_compat.py).
+[scripts/check_compat.py](scripts/check_compat.py), and `__min_hermes__` is one of its matrix
+legs — the floor above is asserted against a real 0.18.2 host on every CI run, not just claimed.
+
+**Why the floor is 0.18.2 and not 0.21.3.** The typing row above is the only thing that is
+less than exact below 0.21.3. Below 0.19.0 the host has no `_stop_typing_with_metadata` at all
+and calls `stop_typing(chat_id)` positionally; 0.19.0 – 0.21.2 have the hook but not the
+`_accepts_kwarg` helper it introspects with. Either way typing is a best-effort path that
+clears on the stream's last-seen topic, and the plugin's hook takes `metadata=None`, so nothing
+raises and no reply is affected. The gate reports these two as *capabilities*, never as
+failures — treating them as failures is what made a true floor look false (#230). That episode
+is recorded as an `open` class in
+[CONTRIBUTING.md § Rules That Bite](CONTRIBUTING.md#rules-that-bite): a gate that does not run,
+or that asserts the wrong contract, is worse than no gate.
 
 ---
 

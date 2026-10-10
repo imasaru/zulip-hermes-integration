@@ -15,7 +15,7 @@ class TestResolveTopic:
     """Test the resolve_topic() method."""
 
     @pytest.fixture
-    def mock_adapter(self):
+    def mock_adapter(self, tmp_path):
         config = MagicMock()
         config.extra = {}
 
@@ -25,10 +25,14 @@ class TestResolveTopic:
                 "ZULIP_API_KEY": "test-key",
                 "ZULIP_EMAIL": "bot@test.com",
                 "ZULIP_SITE": "https://test.zulipchat.com",
+                # clear=True wipes the whole environment, including the data dir
+                # tests/conftest.py pins, so it has to be listed here or the
+                # adapter writes into the developer's real ~/.hermes (#243).
+                "HERMES_DATA_DIR": str(tmp_path),
             },
             clear=True,
         ):
-            with patch("zulip.adapter._import_zulip_sdk") as mock_sdk:
+            with patch("zulip.zulip_client.import_zulip_sdk") as mock_sdk:
                 client = MagicMock()
                 mock_sdk.return_value = MagicMock(Client=lambda **kw: client)
                 adapter = ZulipAdapter(config)

@@ -29,6 +29,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 import zulip.adapter as adapter_module
+# v1.12.0 moved the SDK transport/state into zulip.zulip_client; the SDK
+# handle and ZULIP_AVAILABLE are owned (and must be patched) there.
+import zulip.zulip_client as zulip_client_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PLUGIN_DIR = REPO_ROOT / "zulip"
@@ -57,6 +60,7 @@ _CHILD = textwrap.dedent(
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     A = sys.modules["hermes_plugins.zulip.adapter"]
+    Z = sys.modules["hermes_plugins.zulip.zulip_client"]  # SDK owner since v1.12.0
     out = {}
     # Stub the network: the SDK's Client() fetches server settings and
     # send_message POSTs; both go through requests.Session.request.
@@ -80,7 +84,7 @@ _CHILD = textwrap.dedent(
     if action == "import":
         before = list(sys.path)
         try:
-            sdk = A._import_zulip_sdk()
+            sdk = Z.import_zulip_sdk()
             out["returned_none"] = sdk is None
             out["has_client"] = bool(sdk is not None and hasattr(sdk, "Client"))
             out["sdk_file"] = getattr(sdk, "__file__", None)
@@ -90,8 +94,8 @@ _CHILD = textwrap.dedent(
         out["plugin_modules_intact"] = "hermes_plugins.zulip.adapter" in sys.modules
         # What a caller (adapter / cron delivery) reports:
         try:
-            A._clear_caches()
-            A._get_cached_client("https://zulip.example.test", "bot@example.test", "k" * 32)
+            Z.clear_caches()
+            Z.get_cached_client("https://zulip.example.test", "bot@example.test", "k" * 32)
             out["client_error"] = None
         except BaseException as e:
             out["client_error_type"] = type(e).__name__; out["client_error"] = str(e)
@@ -344,8 +348,8 @@ def fake_sdk(monkeypatch):
     sdk = ModuleType("fake_zulip_sdk")
     sdk.Client = _SdkClient
     _SdkClient.sent = []
-    monkeypatch.setattr(adapter_module, "zulip", sdk)
-    monkeypatch.setattr(adapter_module, "ZULIP_AVAILABLE", True)
+    monkeypatch.setattr(zulip_client_module, "zulip", sdk)
+    monkeypatch.setattr(zulip_client_module, "ZULIP_AVAILABLE", True)
     return _SdkClient
 
 

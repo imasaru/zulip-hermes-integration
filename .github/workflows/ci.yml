@@ -1,19 +1,96 @@
 name: ci
 
+# Actions are pinned to the *oldest* major that runs on Node 24 (Node 20 is
+# deprecated on the hosted runners). Every later major of these three is an
+# unrelated behaviour change, not another runtime bump:
+#
+#   checkout      v5 = node24. v6 moves persisted credentials to a separate
+#                 file; v7 rewrites to ESM and blocks fork-PR checkout under
+#                 pull_request_target / workflow_run.
+#   setup-python  v6 = node24. v7 rewrites to ESM, removes the pip-install
+#                 input and drops EOL Python versions from its manifest.
+#   cache         v5 = node24. v6 ships no release notes at all.
+#
+# All three need actions-runner >= 2.327.1; the hosted ubuntu-latest runner is
+# far past that (2.337.0 as of the last run) and this repo has no self-hosted
+# runners. Bumping past these majors is a separate decision with its own
+# verification, not part of clearing the Node 20 warning.
+
 on:
+  # Push is restricted to the default branch on purpose: without this, a push to
+  # a branch that already has an open PR fires both `push` and `pull_request`, so
+  # every job runs twice (the sibling repo hit this on #304 — 8 checks for 4
+  # jobs).
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      hermes_ref:
+        # Manual escape hatch for the `current` leg, so an arbitrary host tag or
+        # commit can still be tested on demand (the old compat.yml's hermes_ref
+        # input). The `floor` leg is always the pinned tag below.
+        description: "Override the current-host leg's Hermes ref (default: v2026.9.24)"
+        required: false
+        type: string
+
+# Cancel superseded runs for the same ref. A rapid series of pushes to one PR
+# should not queue N full runs — and that matters more here than in most repos,
+# because each `compat` leg installs a real host.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   zulip-bridge:
     runs-on: ubuntu-latest
+    # Bounded on purpose: the default is 360 minutes, so a wedged job would hold
+    # a runner for six hours before failing.
+    timeout-minutes: 15
+    outputs:
+      # "true" when anything other than documentation changed. Consumed by the
+      # `compat` job to skip up to three real host installs for docs-only PRs.
+      # It gates that job's *steps*, never the job itself -- see the note there.
+      code: ${{ steps.filter.outputs.code }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          # The docs-only filter needs the PR base commit, and gitleaks needs the
+          # commit range it scans; a shallow clone makes both unavailable.
+          fetch-depth: 0
+
+      # NOTE: documentation-only changes must still run THIS job. The doc claims
+      # are themselves tested here — tests/test_security_docs.py,
+      # tests/test_readme_docs.py and tests/test_compat_floor.py all assert
+      # against README.md/AGENTS.md/SECURITY.md contents — so a docs edit can
+      # legitimately fail CI. Only the behavioural `compat` job is skipped.
+      - id: filter
+        name: Detect non-documentation changes
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "base commit unavailable — assuming code changed"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "$base" HEAD)"
+          if [ -z "$changed" ]; then
+            echo "no files changed"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed files:"
+          printf '%s\n' "$changed"
+          if printf '%s\n' "$changed" | grep -qvE '\.md$|^docs/|^LICENSE$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Setup Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -21,6 +98,25 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Dependency audit (runtime + test deps)
+        # The sibling's `check:audit` is `npm audit --omit=dev`; this audits
+        # requirements.txt whole, including pytest, on purpose — anything the CI
+        # environment installs is something we are willing to be told is
+        # vulnerable. Clean when this landed (pip-audit: "No known
+        # vulnerabilities found").
+        run: |
+          python -m pip install pip-audit
+          pip-audit --requirement requirements.txt
+
+      - name: gitleaks (secret detection)
+        # v3 is the Node 24 major; v2 is node20 and would re-introduce the
+        # deprecation warning. No GITLEAKS_LICENSE needed: that is only required
+        # for organization-owned repos, and this is a personal account.
+        # Findings are tuned by .gitleaks.toml (one synthetic test fixture).
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Syntax check adapter.py
         run: python -m py_compile zulip/adapter.py
@@ -37,7 +133,13 @@ jobs:
           # verifies downloaded files against the copy in the repo, so a stale
           # entry makes `zulip update` abort with a checksum mismatch for every
           # user. Regenerate exactly as .githooks/pre-push does and diff.
-          for f in zulip/*.py zulip/plugin.yaml zulip/__init__.py; do
+          #
+          # LC_ALL=C pins glob collation so this comparison cannot drift with
+          # the runner's locale: the package has a collation-sensitive pair
+          # (inbound.py vs inbound_queue.py - "." sorts before "_" bytewise,
+          # but after it under e.g. en_US.UTF-8).
+          export LC_ALL=C
+          for f in zulip/*.py zulip/*.sh zulip/plugin.yaml zulip/__init__.py; do
             [ -f "$f" ] && echo "$(sha256sum "$f" | cut -d" " -f1)  ${f#zulip/}"
           done > /tmp/checksums.expected
           if ! diff -u checksums.txt /tmp/checksums.expected; then
@@ -46,7 +148,7 @@ jobs:
           fi
 
       - name: Setup Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -64,3 +166,153 @@ jobs:
             echo "Working directory is not clean. Generated files might be out of sync."
             false
           }
+
+  compat:
+    # Real-host compatibility gate (#141).
+    #
+    # This runs here, behind `needs: zulip-bridge`, rather than in its own
+    # workflow — the same shape the OpenClaw sibling uses. `tests/stubs/` can
+    # never notice that a real gateway lacks a symbol, so this job installs an
+    # actual Hermes host and asserts every gateway symbol, registration kwarg and
+    # behavioural contract the plugin depends on. It is *not* in the fast lane:
+    # `needs:` means the cheap checks decide first, and a red py_compile or
+    # pytest run never pays for two host installs. The fast lane itself is not
+    # slowed — its steps are unchanged and it still reports as soon as it is done.
+    #
+    # Two things the previous separate `compat.yml` got wrong, both fixed here:
+    #
+    # 1. It read the host ref from `HERMES_COMPAT_REF` (repo variable or secret).
+    #    Nothing ever set it, so the weekly cron died in the *first* step with a
+    #    configuration error and never reached the host install. Every leg's ref
+    #    is pinned in this file instead: there is no variable to forget, and a
+    #    missing ref is not a possible failure mode.
+    # 2. It installed the host with
+    #    `pip install "hermes-agent @ git+https://...@${ref}"`, which cannot work
+    #    against any current host: Hermes's build backend refuses a wheel or
+    #    sdist build from a source tree ("Building wheels or sdists for
+    #    hermes-agent is not supported. Hermes is distributed via the shell
+    #    installer, Docker image, or Nix."). Setting the variable alone would
+    #    therefore have moved the failure one step later, not fixed it. The
+    #    install is editable now, which is the one form the backend supports.
+    needs: zulip-bridge
+    # Docs-only PRs must not pay for up to three real host installs, but this job
+    # must still *report*. It is meant to be a required status check, and a
+    # required check that is skipped at the job level never reports success:
+    # GitHub shows "Expected — Waiting for status to be reported" and a docs-only
+    # PR becomes permanently unmergeable (issue #241).
+    #
+    # So the job is unconditional and the *steps* carry the condition. A
+    # docs-only PR still pays for three runners, but each one only checks out and
+    # exits, and every leg reports success. The fast job above always runs too,
+    # because the doc claims are tested there.
+    env:
+      # Whether this PR touched anything but documentation. Read once, from the
+      # fast job's filter, so every step below agrees and no step is forgotten.
+      CODE_CHANGED: ${{ needs.zulip-bridge.outputs.code }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Report every leg even if one fails: a cancelled sibling hides whether the
+      # other hosts regressed.
+      fail-fast: false
+      matrix:
+        # floor   - the *declared* floor, zulip/version.py::__min_hermes__, on the
+        #           host that claim names. Taken from PyPI as a wheel, so this
+        #           leg is seconds. This is the leg that makes the floor claim
+        #           load-bearing in both directions (see the last step).
+        # gated   - the version the exec-approval symbols appear in, which
+        #           AGENTS.md and SECURITY.md both name as >= 0.21.3. Not on
+        #           PyPI, so it comes from git by tag.
+        # current - the newest host release.
+        leg: [floor, gated, current]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Python 3.11
+        if: env.CODE_CHANGED == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Resolve host ref
+        if: env.CODE_CHANGED == 'true'
+        id: host
+        env:
+          INPUT_REF: ${{ inputs.hermes_ref }}
+          LEG: ${{ matrix.leg }}
+        run: |
+          case "$LEG" in
+            floor)   ref="0.18.2";                  source="pypi" ;;
+            gated)   ref="v2026.9.14";              source="git"  ;;  # host 0.21.3
+            current) ref="${INPUT_REF:-v2026.9.24}"; source="git"  ;;  # host 0.21.5
+            *) echo "::error::unknown leg '${LEG}'"; exit 1 ;;
+          esac
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "source=${source}" >> "$GITHUB_OUTPUT"
+          echo "Testing Hermes ${source} ref: ${ref} (leg=${LEG})"
+
+      - name: Cache pip (host dependency tree)
+        if: env.CODE_CHANGED == 'true'
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/pip
+          # Keyed on the leg and host ref, with no restore-keys: a partial key
+          # match could restore wheels cached for a different host ref, and the
+          # host's dependency tree changes between refs. A miss just re-downloads.
+          key: pip-hermes-${{ matrix.leg }}-${{ steps.host.outputs.ref }}
+
+      - name: Install pinned Hermes host (editable)
+        if: env.CODE_CHANGED == 'true'
+        env:
+          # Escape hatch for a host that is not on the default upstream (e.g. a
+          # private host repo). Unset is fine: it defaults, and the job still
+          # needs no configuration.
+          HERMES_COMPAT_REPO: ${{ vars.HERMES_COMPAT_REPO || 'NousResearch/hermes-agent' }}
+          HERMES_REF: ${{ steps.host.outputs.ref }}
+          HERMES_SOURCE: ${{ steps.host.outputs.source }}
+        run: |
+          python -m pip install --upgrade pip
+          if [ "$HERMES_SOURCE" = "pypi" ]; then
+            # The floor is published as a wheel, so no git clone and no build.
+            pip install "hermes-agent==${HERMES_REF}"
+          else
+            # Editable is not a style choice: a plain PEP 508 direct reference
+            # (`pip install "hermes-agent @ git+..."`) fails to build against a
+            # current host, because the backend supports only an editable build
+            # from a source tree. --src keeps the clone out of the checkout so
+            # the workspace stays clean.
+            pip install -e \
+              "git+https://github.com/${HERMES_COMPAT_REPO}@${HERMES_REF}#egg=hermes-agent" \
+              --src "$RUNNER_TEMP/host-src"
+          fi
+
+      - name: Run real-host compatibility gate
+        if: env.CODE_CHANGED == 'true'
+        # Prints the detected host version, each gated capability, and exits
+        # non-zero with an actionable message naming the missing gateway symbol
+        # when the host is present but incompatible.
+        run: python scripts/check_compat.py
+
+      - name: Assert the declared floor is enforced
+        # Only on the floor leg, and only after the gate above has passed: a
+        # floor that nothing asserts is exactly how __min_hermes__ read 0.18.2
+        # while the harness rejected every host below 0.21.3 (#230). Prove the
+        # new check on a host *below* the floor rather than trusting it to not
+        # be dead code.
+        if: matrix.leg == 'floor' && env.CODE_CHANGED == 'true'
+        run: |
+          python -m pip install "hermes-agent==0.18.1" >/dev/null
+          set +e
+          python scripts/check_compat.py > /tmp/below-floor.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/below-floor.log
+          if [ "$status" -ne 1 ]; then
+            echo "::error::check_compat exited ${status} for host 0.18.1, which is below the declared floor __min_hermes__=0.18.2. The floor is not being enforced."
+            exit 1
+          fi
+          if ! grep -q "below the declared floor" /tmp/below-floor.log; then
+            echo "::error::0.18.1 was rejected for some other reason; the floor check did not fire."
+            exit 1
+          fi
+          echo "floor enforced: 0.18.1 rejected, 0.18.2 accepted"

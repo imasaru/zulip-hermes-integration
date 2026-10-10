@@ -1,7 +1,7 @@
 name: zulip
 label: Zulip
 kind: platform
-version: 1.10.1
+version: 1.12.0
 description: Zulip gateway adapter for Hermes Agent. Supports streams with topics and private messages.
 author: Niyaz
 requires_env:
@@ -17,9 +17,15 @@ requires_env:
     description: "Zulip organization URL (e.g. https://your-org.zulipchat.com)"
     prompt: "Zulip site URL"
 optional_env:
+  - name: ZULIP_PROFILE
+    description: 'Named default posture. "recommended" turns on the shared-teammate defaults (mention-gated streams, DM allowlist seeded from the Zulip bot owner, activity trace, on-demand history, observation, per-session queue, per-topic sessions, reaction triggers) without editing any other setting. An explicit ZULIP_* value always wins; unset means unchanged legacy behaviour (default: none)'
+    prompt: "Profile (recommended | leave empty)"
   - name: ZULIP_ALLOWED_USERS
     description: "Comma-separated emails allowed to talk to the bot"
     prompt: "Allowed users (comma-separated)"
+  - name: ZULIP_OWNER_EMAIL
+    description: "The bot owner's Zulip email. Under ZULIP_PROFILE=recommended this is discovered from Zulip automatically; set it when the bot is organisation-owned, when auto-detection is wrong, or when no one can DM the bot (default: empty)"
+    prompt: "Owner email (usually auto-detected)"
   - name: ZULIP_REACTIONS_ENABLED
     description: "Enable emoji reaction status indicators (default: true)"
     prompt: "Enable reactions"
@@ -119,6 +125,12 @@ optional_env:
   - name: ZULIP_TOPIC_SESSIONS
     description: "Give each stream topic its own conversation session (default: false)"
     prompt: "Per-topic sessions"
+  - name: ZULIP_APPROVAL_ON_TIMEOUT
+    description: 'What an unanswered exec approval means: "allow" (default, today''s behaviour) or "deny" (fail closed — the bot says in the topic that the request was refused and records the timeout). The gateway owns the approval timeout and refuses an unanswered request either way; this key decides what the install promises about silence. The recommended profile sets "deny".'
+    prompt: "Unanswered exec approvals"
+  - name: ZULIP_APPROVAL_AUTHORITY
+    description: 'Who may decide an exec approval: "anyone" (default, today''s behaviour — anyone who can see the prompt) or "owner" (only the bot owner, resolved from Zulip or ZULIP_OWNER_EMAIL; a decision from anyone else is refused and the prompt stays open for the owner). When "owner" is set and no owner can be resolved, nobody may decide. The recommended profile sets "owner".'
+    prompt: "Who may approve exec requests"
   - name: ZULIP_STREAM_OVERRIDES
     description: 'Per-stream chatmode overrides as a JSON object, e.g. {"bot lab": {"chatmode": "onmessage"}}'
     prompt: "Per-stream chatmode overrides (JSON)"

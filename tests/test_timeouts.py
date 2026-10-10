@@ -76,7 +76,7 @@ class TestSdkCallTimeout:
     """Test that _sdk_call enforces timeouts."""
 
     @pytest.mark.asyncio
-    async def test_sdk_call_succeeds_within_timeout(self, caplog):
+    async def test_sdk_call_succeeds_within_timeout(self, caplog, tmp_path):
         """Normal completion when function returns in time."""
         config = MagicMock()
         config.extra = {}
@@ -87,10 +87,14 @@ class TestSdkCallTimeout:
                 "ZULIP_API_KEY": "test-key",
                 "ZULIP_EMAIL": "bot@test.com",
                 "ZULIP_SITE": "https://test.zulipchat.com",
+                # clear=True wipes the whole environment, including the data dir
+                # tests/conftest.py pins, so it has to be listed here or the
+                # adapter writes into the developer's real ~/.hermes (#243).
+                "HERMES_DATA_DIR": str(tmp_path),
             },
             clear=True,
         ):
-            with patch("zulip.adapter._import_zulip_sdk") as mock_sdk:
+            with patch("zulip.zulip_client.import_zulip_sdk") as mock_sdk:
                 client = MagicMock()
                 mock_sdk.return_value = MagicMock(Client=lambda **kw: client)
                 adapter = ZulipAdapter(config)
@@ -102,7 +106,7 @@ class TestSdkCallTimeout:
         assert result == {"result": "success"}
 
     @pytest.mark.asyncio
-    async def test_sdk_call_raises_timeout_error(self, caplog):
+    async def test_sdk_call_raises_timeout_error(self, caplog, tmp_path):
         """asyncio.TimeoutError raised when function exceeds timeout."""
         config = MagicMock()
         config.extra = {}
@@ -113,10 +117,14 @@ class TestSdkCallTimeout:
                 "ZULIP_API_KEY": "test-key",
                 "ZULIP_EMAIL": "bot@test.com",
                 "ZULIP_SITE": "https://test.zulipchat.com",
+                # clear=True wipes the whole environment, including the data dir
+                # tests/conftest.py pins, so it has to be listed here or the
+                # adapter writes into the developer's real ~/.hermes (#243).
+                "HERMES_DATA_DIR": str(tmp_path),
             },
             clear=True,
         ):
-            with patch("zulip.adapter._import_zulip_sdk") as mock_sdk:
+            with patch("zulip.zulip_client.import_zulip_sdk") as mock_sdk:
                 client = MagicMock()
                 mock_sdk.return_value = MagicMock(Client=lambda **kw: client)
                 adapter = ZulipAdapter(config)
@@ -136,7 +144,7 @@ class TestSdkCallTimeout:
         )
 
     @pytest.mark.asyncio
-    async def test_sdk_call_logs_warning_on_timeout(self, caplog):
+    async def test_sdk_call_logs_warning_on_timeout(self, caplog, tmp_path):
         """Timeout produces a warning log with function name."""
         config = MagicMock()
         config.extra = {}
@@ -147,10 +155,14 @@ class TestSdkCallTimeout:
                 "ZULIP_API_KEY": "test-key",
                 "ZULIP_EMAIL": "bot@test.com",
                 "ZULIP_SITE": "https://test.zulipchat.com",
+                # clear=True wipes the whole environment, including the data dir
+                # tests/conftest.py pins, so it has to be listed here or the
+                # adapter writes into the developer's real ~/.hermes (#243).
+                "HERMES_DATA_DIR": str(tmp_path),
             },
             clear=True,
         ):
-            with patch("zulip.adapter._import_zulip_sdk") as mock_sdk:
+            with patch("zulip.zulip_client.import_zulip_sdk") as mock_sdk:
                 client = MagicMock()
                 mock_sdk.return_value = MagicMock(Client=lambda **kw: client)
                 adapter = ZulipAdapter(config)

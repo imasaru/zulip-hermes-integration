@@ -9,7 +9,8 @@ visible instead of discoverable.
 
 - **Machine-readable source of truth:** [`docs/parity-matrix.yaml`](parity-matrix.yaml)
 - **Validator / drift reporter:** [`scripts/parity_check.py`](../scripts/parity_check.py)
-- **CI:** [`.github/workflows/parity.yml`](../.github/workflows/parity.yml)
+- **Runs:** manual — `python3 scripts/parity_check.py` (there is deliberately no
+  scheduled CI job for this any more; see the note below)
 - **Tracking issue:** [#140](https://github.com/niyazmft/zulip-hermes-integration/issues/140) ·
   mirror [`openclaw-zulip-bridge#298`](https://github.com/niyazmft/openclaw-zulip-bridge/issues/298)
 
@@ -71,6 +72,8 @@ and the note says so. Verify on the sibling side before claiming `both`.
 | Settings / state scoped to the Hermes profile | `sister-only` | `#156` | — |
 | Session archive repair for hosts without hard links | `sister-only` | — | `session-archive-repair.ts` |
 | Native exec-approval buttons via the `zform` widget | `hermes-only` | `#131` | — |
+| Approval-outcome audit + fail-closed refusal line (`ZULIP_APPROVAL_ON_TIMEOUT`) | `hermes-only` | `#222` | — |
+| Owner-only exec approvals (`ZULIP_APPROVAL_AUTHORITY`) | `hermes-only` | `#228` | — |
 | Admin actions (`/streams`, `/user`, `/pin`, `/unpin`) | `hermes-only` | `admin_actions.py` | *different action set* |
 | Per-topic conversation sessions | `hermes-only` | `_topic_sessions_enabled` | — |
 | Per-stream chatmode overrides (`ZULIP_STREAM_OVERRIDES`) | `hermes-only` | `_resolve_stream_overrides` | — |
@@ -318,9 +321,12 @@ Event catalogue (shared names first):
    update the rendered table above in the same PR.
 2. Run `python3 scripts/parity_check.py` — it validates the schema and prints the
    new delta.
-3. The `parity.yml` workflow runs the same check on every PR that touches these
-   files, on push to `main`, and weekly, so drift shows up even when no one edits
-   the matrix.
+3. Nothing runs this automatically. The former `parity.yml` workflow (added for
+   #140) was removed as noise: it printed a drift delta nobody acted on, and it
+   fired on the same weekly cron as the real host-compat gate — a passing
+   visibility job sitting next to a failing one. Run
+   `python3 scripts/parity_check.py` by hand when you touch the matrix or port a
+   feature, so the drift you are creating or clearing is in front of you.
 4. A non-empty delta is not a failure. It is a prompt: port the feature, file it,
    or record why the divergence is intentional.
 

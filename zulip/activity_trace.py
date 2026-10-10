@@ -72,39 +72,26 @@ class TraceConfig:
     def from_env(cls, env: Optional[dict] = None) -> "TraceConfig":
         if env is None:
             # Resolve through the active Hermes profile so trace settings cannot
-            # leak across profiles under multiplexing (#156).
+            # leak across profiles under multiplexing (#156) -- and through the
+            # preset gate, so ZULIP_PROFILE=recommended turns the trace on for a
+            # fresh install (#213). The other four are not preset knobs, so for
+            # them this resolves exactly as ``get_setting`` always has.
             #
-            # During plugin load time (before _profile_runtime_scope installs
-            # set_secret_scope), runtime_scope.get_setting() would raise
-            # UnscopedSecretError because multiplex is active but no scope is
-            # installed.  Fall back to os.getenv for non-credential settings
-            # so the adapter can still construct.  Credentials (API key, email,
-            # site) are resolved later in the adapter's own __init__ inside
-            # the proper scope.
+            # Fork: during plugin load (before the profile scope is installed)
+            # the scoped read raises UnscopedSecretError under multiplexing;
+            # fall back to the process env for these non-credential settings so
+            # the adapter can still construct.
+            keys = (
+                "ZULIP_ACTIVITY_TRACE",
+                "ZULIP_TRACE_COALESCE_MS",
+                "ZULIP_TRACE_MAX_RATE",
+                "ZULIP_TRACE_MAX_CONTENT",
+                "ZULIP_TRACE_TOOL_MATCHER",
+            )
             try:
-                env = {
-                    key: runtime_scope.get_setting(key)
-                    for key in (
-                        "ZULIP_ACTIVITY_TRACE",
-                        "ZULIP_TRACE_COALESCE_MS",
-                        "ZULIP_TRACE_MAX_RATE",
-                        "ZULIP_TRACE_MAX_CONTENT",
-                        "ZULIP_TRACE_TOOL_MATCHER",
-                    )
-                }
+                env = {key: runtime_scope.effective_value(key) for key in keys}
             except Exception:
-                # Fallback to process environment when no profile scope is
-                # installed yet (plugin-load-time).
-                env = {
-                    key: os.environ.get(key, "")
-                    for key in (
-                        "ZULIP_ACTIVITY_TRACE",
-                        "ZULIP_TRACE_COALESCE_MS",
-                        "ZULIP_TRACE_MAX_RATE",
-                        "ZULIP_TRACE_MAX_CONTENT",
-                        "ZULIP_TRACE_TOOL_MATCHER",
-                    )
-                }
+                env = {key: os.environ.get(key, "") for key in keys}
 
         def _num(key: str, default: float, cast: Callable[[str], Any]) -> Any:
             try:

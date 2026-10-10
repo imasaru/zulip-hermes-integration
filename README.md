@@ -1,7 +1,7 @@
 # 📬 Zulip Plugin for Hermes
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://python.org)
-[![Tests](https://img.shields.io/badge/tests-1168%20passing-brightgreen)](https://github.com/niyazmft/zulip-hermes-integration/actions)
+[![Tests](https://github.com/niyazmft/zulip-hermes-integration/actions/workflows/ci.yml/badge.svg?branch=main&label=tests)](https://github.com/niyazmft/zulip-hermes-integration/actions/workflows/ci.yml)
 [![Hermes](https://img.shields.io/badge/Hermes-%3E%3D0.18.2-green)](https://hermes-agent.nousresearch.com)
 [![Latest Release](https://img.shields.io/github/v/release/niyazmft/zulip-hermes-integration?label=release)](https://github.com/niyazmft/zulip-hermes-integration/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -27,6 +27,7 @@ Hermes gateway adapter for Zulip streams and private messages, with topic thread
 - [Progressive Activity Trace](#progressive-activity-trace)
 - [History-aware Context](#history-aware-context)
 - [In-Channel Action Triggers](#in-channel-action-triggers)
+- [Exec Approvals](#exec-approvals)
 - [Sticky Engagement](#sticky-engagement)
 - [Per-Session Queue](#per-session-queue)
 - [Stream Watching](#stream-watching)
@@ -39,7 +40,8 @@ Hermes gateway adapter for Zulip streams and private messages, with topic thread
 
 ## Prerequisites
 
-- **Hermes** `>= 0.18.2` (native exec-approval buttons need `>= 0.21.3`)
+- **Hermes** `>= 0.18.2` (native exec-approval buttons need `>= 0.21.3`; below that, typing
+  clears on the stream's last-seen topic — see [gateway compatibility](AGENTS.md#-gateway-compatibility))
 - **Python** 3.10+
 - **A Zulip bot** — see below
 
@@ -86,6 +88,40 @@ gateway:
 > ⚠️ Install the whole repository, not individual files — the plugin is 28 modules that
 > import from each other, so copying only `adapter.py` fails to load.
 
+### Recommended setup — the whole product, one question
+
+The plugin reads 50+ knobs, but a fresh install needs none of them. Run setup,
+answer **one** question, and stop:
+
+```bash
+hermes gateway setup   # site, bot email, API key, then "Use the recommended setup?" (yes)
+```
+
+Answering yes writes `ZULIP_PROFILE=recommended` and asks nothing else — no
+prompt wall, and `.env` stays at three credentials plus that one line. That
+marker turns on a complete shared-room teammate: mention-gated streams, DMs for
+the bot's Zulip owner only, the activity trace, on-demand history, observation,
+per-session queueing, per-topic sessions and the reaction triggers. Sticky
+engagement and actionable refs stay off. Any `ZULIP_*` value you set later still
+wins over it.
+
+To see what it decided — every value with its source, `env` / `profile` /
+`default` — or to change it:
+
+```bash
+bash ~/.hermes/plugins/zulip/config.sh             # the settings that matter
+bash ~/.hermes/plugins/zulip/config.sh --advanced  # every knob the plugin reads
+bash ~/.hermes/plugins/zulip/config.sh --wizard    # change them, deviations only
+```
+
+The [Environment Variable Reference](#environment-variable-reference) below is
+the **advanced** surface: every knob, with examples.
+
+**Unset `ZULIP_PROFILE` and none of this applies.** An install without the marker
+behaves exactly as it did before the flag existed — that is a tested contract, not
+a hope. The full spec is in
+[docs/RECOMMENDED-PROFILE.md](docs/RECOMMENDED-PROFILE.md).
+
 ### Container / system-wide install
 
 To install for every user on the host instead:
@@ -109,6 +145,28 @@ Or by hand:
 ```bash
 cd ~/.hermes/plugins/zulip && git pull origin main && hermes gateway restart
 ```
+
+### Inspecting and changing settings
+
+With `ZULIP_PROFILE=recommended` you should rarely need to set anything, but
+`zulip config` answers "what did it decide for me?" by printing every knob with
+the **source** of its value — `env` (you set it), `profile` (supplied by the
+preset) or `default` (the built-in):
+
+```bash
+bash ~/.hermes/plugins/zulip/config.sh             # the settings that matter
+bash ~/.hermes/plugins/zulip/config.sh --advanced  # every knob the plugin reads
+bash ~/.hermes/plugins/zulip/config.sh --wizard    # change them, interactively
+```
+
+`config.sh` needs the same Python that runs the gateway, because importing the
+plugin imports the Hermes host. It finds that automatically from the `hermes`
+launcher; set `ZULIP_PYTHON=/path/to/that/python` if it cannot.
+
+The wizard writes **only deviations** to `.env`: answering with the value the
+profile (or the built-in default) already supplies removes the entry instead of
+restating it, so the file stays a short list of where this install differs
+rather than a copy of the profile.
 
 DM the bot, or @-mention it in a stream it is subscribed to.
 
@@ -197,6 +255,12 @@ and leave this alone.
 A mention is detected from Zulip's own `mentioned` flag first; text matching is a fallback
 that recognises `@Soju`, `@**Soju**`, `@_**Soju**`, `@**Soju|12**` and a hand-typed
 `@soju-bot`, for both the display name and the email local-part.
+
+**A native slash command is never mention-gated.** `/help`, `/model`, `/stop`, `/approve`,
+`/deny` and the plugin's own commands reach the gateway in any mode, including `oncall` in a
+quiet topic with no engagement. The trigger gate is about conversation, and a command is not
+conversation; the sender rate limit, the stream filter, group policy and stream policy still
+apply to it, and an admin-only command is still the gateway's decision.
 
 ## Slash Commands
 
@@ -349,6 +413,46 @@ Deliberately **not** supported: launching arbitrary named workflows or scripts. 
 is an instruction to the agent already in this conversation, so its blast radius equals
 someone typing that sentence.
 
+## Exec Approvals
+
+Hermes stops before a dangerous command and asks the room. On Hermes `>= 0.21.3` the
+Zulip adapter renders that prompt natively — one message of context and one zform
+message whose buttons are **Allow Once / Allow Session / Always Allow / Deny**; on older
+gateways the prompt is plain text with `/approve` and `/deny` instructions, and either
+way the click or the typed command reaches the gateway (a slash command is never
+mention-gated).
+
+**Nobody answering is a refusal, and the bot says so.** Once the gateway's
+`approvals.timeout` elapses the command does *not* run — on every host this plugin
+supports. `ZULIP_APPROVAL_ON_TIMEOUT` decides what the *install promises* about that
+silence, and therefore what the bot states and records:
+
+| Value | What happens when nobody answers |
+|-------|----------------------------------|
+| `allow` *(default)* | Today's behaviour exactly: the gateway's own outcome stands and the bot adds nothing to the topic. |
+| `deny` | The refusal is stated in the prompt's topic and recorded — one line saying the request was refused, plus an audit entry naming `timeout` as the decider. **The recommended profile sets this.** On hosts `>= 0.21.4` the gateway posts its own timeout notice, so the bot stays quiet instead of repeating it. |
+
+Whichever value is set, a person's `/deny` is confirmed in the topic by the gateway, and
+the bot does not duplicate it. Every resolved approval also lands in the audit log with
+its choice, its decider (the person who clicked, or `timeout` / `policy` / `cancelled` /
+`undelivered`) and the request id the plugin minted for the prompt, so "who let this run,
+and did anyone?" is a lookup rather than a guess. This key is a policy statement, not a
+second decision path: the buttons remain the only way to approve, and no setting can make
+silence run a command.
+
+**Who may decide.** The prompt lands in a *topic*, so on a shared work Zulip "anyone who
+can read it" is a privilege escalation through a side channel: a coworker approves your bot
+running a command on your host, with your credentials, and the audit names the coworker as
+the decider of your bot.
+
+| `ZULIP_APPROVAL_AUTHORITY` | What happens when someone decides |
+|-------|-----------------------------------|
+| `anyone` *(default)* | Today's behaviour exactly: anyone who can see the prompt may answer it. |
+| `owner` | Only the bot owner may decide — the identity Zulip reports as the bot's `bot_owner_id`, or `ZULIP_OWNER_EMAIL` when you name it explicitly. Anyone else's `/approve` or `/deny` is refused: it is stated in the topic, audited with their identity, and **not counted**, so the prompt stays open for you and the timeout default still applies. **The recommended profile sets this.** If no owner can be resolved, nobody can decide — including you — and the bot says so in the topic and in the startup log, naming `ZULIP_OWNER_EMAIL` as the fix. |
+
+A refusal is a rule, not a second UI: there is no approver list to configure, because a
+set of approvers would recreate the problem it is meant to close.
+
 ## Sticky Engagement
 
 > `@**hermes-bot** fix the typo in the README` → then, **without
@@ -374,6 +478,15 @@ ZULIP_ENGAGEMENT_TTL_MINUTES=45      # idle window; 45 is the default
 | `ZULIP_ENGAGEMENT_EXPIRY_SCAN_SECONDS` | default `30` | how often expiry is checked |
 
 End it early with `stop listening`, `/unlisten` or `/stop-listening` in the topic.
+
+**Bot traffic never keeps a window open.** A message whose sender is a bot — our own
+send echoed back, or any address following Zulip's `<name>-bot@…` convention — is neither
+answered *because* the topic is engaged nor allowed to refresh the idle TTL. Otherwise two
+bots in one topic would keep each other's window open forever, outliving the human who
+started the conversation. This is a loop-prevention invariant rather than a setting: no key
+turns it off, so it cannot be re-enabled by accident. A bot that @mentions the bot
+explicitly is a separate, deliberate act — mention gating is unchanged, it just does not
+open a window of its own.
 
 An invalid value here is logged and falls back safely (`off` / `user`) rather than
 half-enabling the feature.
@@ -548,10 +661,17 @@ choice when you do not want a code at all: it just reads `ZULIP_ALLOWED_USERS`.
 
 | Variable | Default | Example | Notes |
 |----------|---------|---------|-------|
-| `ZULIP_TOPIC_SESSIONS` | `false` | `true` | give each topic its own session |
+| `ZULIP_TOPIC_SESSIONS` | `false` | `true` | give each topic its own session — rename-proof: sessions key on stable conversation ids, so renaming a topic continues its session; `/new` starts a fresh one |
 | `ZULIP_DM_SESSION_TURN_LIMIT` | `20` | `0` | rotate a DM session after N turns; `0` disables |
 | `ZULIP_SESSION_QUEUE` | `false` | `1` | hold a mid-run message behind the running turn |
 | `ZULIP_QUEUE_CAP` | `20` | `5` | how many may wait before dispatching immediately |
+
+### Exec approvals
+
+| Variable | Default | Example | Notes |
+|----------|---------|---------|-------|
+| `ZULIP_APPROVAL_ON_TIMEOUT` | `allow` | `deny` | What an unanswered approval means: `allow` = today's behaviour (the gateway's refusal stands, the bot adds nothing); `deny` = also state the refusal in the topic and record `timeout` as the decider. The gateway owns the timeout and refuses either way — no setting makes silence run a command |
+| `ZULIP_APPROVAL_AUTHORITY` | `anyone` | `owner` | Who may decide an exec approval: `anyone` = today's behaviour; `owner` = only the bot owner (`bot_owner_id`, or `ZULIP_OWNER_EMAIL`), with anyone else's decision refused, stated in the topic and audited, and the prompt left open for the owner. With no owner resolvable, nobody can decide |
 
 ### Sticky engagement
 
@@ -648,17 +768,25 @@ bash scripts/setup-hooks.sh          # install the pre-push hook
 
 # ... make changes ...
 
-python3 -m pytest tests/             # 1,168 tests
+python3 -m pytest tests/             # the full unit suite
 bash .githooks/pre-push              # checksums + syntax + manifest + tests
 ```
 
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for development setup, the checks CI runs and the
+repo-specific rules (the updater manifest, `plugin.yaml` declarations, `checksums.txt`).
+
 Then open a PR. `main` is protected: PR required, linear history, squash merge, and the
-`zulip-bridge` GitHub Actions job must pass.
+`zulip-bridge` GitHub Actions job must pass — the **Tests** badge at the top of this file is
+that workflow's live status. No test *count* is written down here: a copied number is wrong the
+moment the next test lands, and a published one needs a branch and a write-permission job to
+stay true.
 
 ## Documentation
 
 - **[AGENTS.md](AGENTS.md)** — the runtime guide the agent itself reads: addressing rules, metadata, injected context labels, troubleshooting
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — development setup, what CI runs, repo-specific rules
 - **[SECURITY.md](SECURITY.md)** — threat model, credential handling, explicit non-guarantees
+- **[SUPPORT.md](SUPPORT.md)** — where to ask for help
 - **[docs/RELEASING.md](docs/RELEASING.md)** — release procedure
 - **[CHANGELOG.md](CHANGELOG.md)** — release history
 
