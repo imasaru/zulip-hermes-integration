@@ -178,7 +178,14 @@ def block_secret_leaks_enabled(env: Optional[Mapping[str, str]] = None) -> bool:
     supplied, so the flag cannot leak across profiles under multiplexing (#156).
     """
     if env is None:
-        raw = runtime_scope.get_setting("ZULIP_BLOCK_SECRET_LEAKS")
+        try:
+            raw = runtime_scope.get_setting("ZULIP_BLOCK_SECRET_LEAKS")
+        except Exception:
+            # Unscoped read under a multiplexed gateway (UnscopedSecretError),
+            # e.g. a send that runs after the turn's profile scope closed.
+            # Fail safe: keep the guard ON (its documented default) instead
+            # of crashing the send.
+            return True
     else:
         raw = env.get("ZULIP_BLOCK_SECRET_LEAKS")
     if raw is None or str(raw).strip() == "":

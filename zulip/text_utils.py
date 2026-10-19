@@ -391,9 +391,13 @@ _NAMED_FUNCTION_BLOCK_PATTERN = re.compile(
 )
 
 # After closed pairs are removed, any remaining opening tag is unclosed, so
-# everything from it to the end of the text sits inside the block.
+# everything from it to the end of the text sits inside the block -- wherever
+# it starts (mid-line included) -- and the text before it, newline included,
+# is kept verbatim. Upstream semantics (issue #152), adopted 2026-10-11: the
+# fork's LINE-style "line start only" anchor let a cut-off mid-line reasoning
+# block reach Zulip and ate the preceding newline.
 _UNTERMINATED_REASONING_BLOCK_PATTERN = re.compile(
-    rf'(?:^|\n)[ \t]*<(?:{"|".join(_REASONING_TAG_NAMES)})\b[^>]*>.*$',
+    rf'<(?:{"|".join(_REASONING_TAG_NAMES)})\b[^>]*>.*$',
     re.DOTALL | re.IGNORECASE,
 )
 
