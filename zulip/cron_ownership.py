@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -176,23 +177,60 @@ def profile_dir_names(adapter: Any) -> set[str]:
     return names
 
 
+# A trailing " (...)" suffix is what Zulip appends to a bot mention, e.g.
+# ``@**Treasurer (hermes-ai-agent)**``. Strip it before name matching and use
+# its presence as the signal that the label names a bot-like identity.
+_SUFFIX_RE = re.compile(r"\s+\([^)]*\)\s*$")
+
+
+def _strip_mention_suffix(label: str) -> str:
+    """Remove a trailing " (...)" suffix from a mention label."""
+    return _SUFFIX_RE.sub("", label).strip()
+
+
 def classify_command_target(adapter: Any, target: str | None) -> str:
     """``self``, ``other``, or ``none`` for a mention label on a slash command.
 
-    ``none`` is a human mention (or anything we cannot tie to a profile): the
-    command stays unnamed and the topic owner handles it.
+    A label names a bot-like identity (and so must not fall through to the
+    topic owner) when it is self, matches a registered bot or profile dir, or
+    carries the `` (suffix)`` that Zulip adds to bot mentions. A plain name
+    with no suffix that is not self or a known profile is treated as a human
+    mention and left for the topic owner.
     """
-    key = (target or "").strip().lower()
-    if not key:
+    if not target or not target.strip():
         return "none"
-    if key in self_aliases(adapter):
-        return "self"
-    alias_profile = profile_for_alias(key)
+
     me = own_profile_name(adapter).strip().lower()
-    if alias_profile:
-        return "self" if alias_profile.strip().lower() == me else "other"
-    if key in profile_dir_names(adapter):
-        return "self" if key == me else "other"
+    label = target.strip()
+
+    # (a) Classify by the mentioning user's id first. A command may arrive as
+    #     ``Name|<id>``; keep the id so this works even when the name would
+    #     otherwise look like the owner.
+    name_part, _, id_part = label.partition("|")
+    id_part = id_part.strip()
+    if id_part.isdigit():
+        bot_profile = profile_for_bot(sender_id=id_part)
+        if bot_profile is not None:
+            return "self" if bot_profile.strip().lower() == me else "other"
+
+    # (b) Compare names case-insensitively after stripping a trailing
+    #     " (...)" suffix, and also against profile names and email
+    #     local-parts.
+    key = _strip_mention_suffix(name_part).lower()
+    if key:
+        if key in self_aliases(adapter):
+            return "self"
+        alias_profile = profile_for_alias(key)
+        if alias_profile:
+            return "self" if alias_profile.strip().lower() == me else "other"
+        if key in profile_dir_names(adapter):
+            return "self" if key == me else "other"
+
+    # (d) The label names a bot-like identity (Zulip suffix) that is not self
+    #     and not otherwise known: it must not fall through to the topic owner.
+    if _SUFFIX_RE.search(label):
+        return "other"
+
     return "none"
 
 

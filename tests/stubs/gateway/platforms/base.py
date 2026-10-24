@@ -66,6 +66,7 @@ class MessageEvent:
     source: MessageSource = field(default_factory=MessageSource)
     message_id: str = ""
     metadata: dict = field(default_factory=dict)
+    reply_expected: Optional[bool] = None
 
 
 class BasePlatformAdapter:

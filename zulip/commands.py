@@ -36,8 +36,11 @@ _YOLO_RE = re.compile(r"^/yolo\b", re.IGNORECASE)
 # (``/cmd args @**Bot**``). ``strip_html_to_text`` reduces ``@**Bot**`` to
 # ``@Bot`` before this runs, so both the markup and the bare form are accepted.
 # The label may contain spaces (``@Home Manager``) and a Zulip ``|id`` suffix.
+# A bare (non-``**``) mention may also carry a Zulip "(username)" suffix when the
+# markup has been stripped (``@Name (user)``); accept an optional trailing group
+# so such a plain mention still splits and can be classified.
 _MARKUP_MENTION = r"_?\*\*[^*|]+?(?:\|\d+)?\*\*"
-_PLAIN_MENTION = r"[\w][\w.-]*(?:\s+[\w][\w.-]*)*(?:\|\d+)?"
+_PLAIN_MENTION = r"[\w][\w.-]*(?:\s+[\w][\w.-]*)*(?:\s+\([^)]*\))?(?:\|\d+)?"
 _MENTION_NAME = rf"(?:{_MARKUP_MENTION}|{_PLAIN_MENTION})"
 _LEADING_COMMAND_RE = re.compile(
     rf"^@(?P<name>{_MENTION_NAME})\s+(?P<body>/[^\s].*)$",
@@ -50,14 +53,17 @@ _TRAILING_COMMAND_RE = re.compile(
 
 
 def _mention_label(name: str) -> str:
-    """Display name inside one mention token, without markup or ``|id``."""
+    """The label inside one mention token, with markup removed.
+
+    The trailing ``|<id>`` is preserved so the caller can classify a command
+    by the mentioning user's id; the display name (with any `` (suffix)``) is
+    kept so bot-like mentions can still be recognised.
+    """
     text = (name or "").strip()
     if text.startswith("_**") and text.endswith("**"):
         text = text[3:-2]
     elif text.startswith("**") and text.endswith("**"):
         text = text[2:-2]
-    if "|" in text:
-        text = text.split("|", 1)[0]
     return text.strip()
 
 
