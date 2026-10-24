@@ -65,6 +65,103 @@ def profile_owns_approval(
         return True
 
 
+async def _topic_owner_processes(
+    adapter,
+    message: dict,
+    *,
+    stream_name: str,
+    message_id,
+    label: str,
+) -> bool:
+    """Topic cron owner, or the fallback profile, wins this stream message.
+
+    The per-message claim settles two adapters that resolve the same owner.
+    A lost claim drops. A claim that cannot be recorded processes: dropping
+    the only owner is worse than a duplicate. Unexpected errors propagate
+    so the caller can choose fail-open or fail-closed.
+    """
+    from . import auto_reply as _ar
+    from . import cron_ownership as _co
+
+    _co.register_bot_identity(adapter)
+    me = _co.own_profile_name(adapter)
+    cfg = _ar.resolve_auto_reply_settings()
+    stream_id = message.get("stream_id")
+    topic = (message.get("subject") or "").strip()
+    found, _api_ok = await _ar.resolve_topic_cron_owner(
+        adapter,
+        stream_id,
+        topic,
+        settings=cfg,
+        stream_name=stream_name,
+    )
+    owner = (
+        found.owner_profile
+        if (found is not None and found.owner_profile)
+        else cfg.fallback_profile
+    )
+    if owner != me:
+        logger.debug(
+            "zulip %s dropped: topic owner is %s, not %s",
+            label,
+            owner,
+            me,
+        )
+        return False
+    try:
+        won = _ar.claim_message(message_id, me, adapter=adapter)
+    except Exception:
+        logger.debug("zulip %s claim failed; processing", label, exc_info=True)
+        return True
+    if not won:
+        logger.info(
+            "zulip %s claim lost [msg=%s owner=%s]",
+            label,
+            message_id,
+            owner,
+        )
+        return False
+    return True
+
+
+async def should_process_topic_command(
+    adapter,
+    message: dict,
+    *,
+    stream_name: str,
+    message_id,
+) -> bool:
+    """Whether this adapter owns an unnamed stream slash command.
+
+    Same owner and claim as ``/yolo``, but a routing failure does not fan
+    out: only the fallback profile proceeds, and if that cannot be resolved
+    nobody does.
+    """
+    try:
+        return await _topic_owner_processes(
+            adapter,
+            message,
+            stream_name=stream_name,
+            message_id=message_id,
+            label="slash command",
+        )
+    except Exception:
+        logger.debug("zulip slash command routing failed", exc_info=True)
+        try:
+            from . import auto_reply as _ar
+            from . import cron_ownership as _co
+
+            me = _co.own_profile_name(adapter)
+            cfg = _ar.resolve_auto_reply_settings()
+            return me == cfg.fallback_profile
+        except Exception:
+            logger.debug(
+                "zulip slash command fallback lookup failed; dropping",
+                exc_info=True,
+            )
+            return False
+
+
 async def should_process_yolo(
     adapter,
     message: dict,
@@ -95,46 +192,13 @@ async def should_process_yolo(
             return True
         if msg_type != "stream":
             return True
-        from . import auto_reply as _ar
-        from . import cron_ownership as _co
-
-        _co.register_bot_identity(adapter)
-        me = _co.own_profile_name(adapter)
-        cfg = _ar.resolve_auto_reply_settings()
-        stream_id = message.get("stream_id")
-        topic = (message.get("subject") or "").strip()
-        found, _api_ok = await _ar.resolve_topic_cron_owner(
+        return await _topic_owner_processes(
             adapter,
-            stream_id,
-            topic,
-            settings=cfg,
+            message,
             stream_name=stream_name,
+            message_id=message_id,
+            label="/yolo",
         )
-        owner = (
-            found.owner_profile
-            if (found is not None and found.owner_profile)
-            else cfg.fallback_profile
-        )
-        if owner != me:
-            logger.debug(
-                "zulip /yolo dropped: topic owner is %s, not %s",
-                owner,
-                me,
-            )
-            return False
-        try:
-            won = _ar.claim_message(message_id, me, adapter=adapter)
-        except Exception:
-            logger.debug("zulip /yolo claim failed; processing", exc_info=True)
-            return True
-        if not won:
-            logger.info(
-                "zulip /yolo claim lost [msg=%s owner=%s]",
-                message_id,
-                owner,
-            )
-            return False
-        return True
     except Exception:
         logger.debug("zulip /yolo routing failed; processing", exc_info=True)
         return True

@@ -213,6 +213,14 @@ class ZulipConnection:
         bot_user_id = str(probe_result.get("bot", {}).get("id", ""))
         if bot_user_id:
             adapter._bot_user_id = bot_user_id
+        # Mention routing needs this bot's names even for a command that
+        # arrives before any other adapter has seen it register.
+        try:
+            from . import cron_ownership
+
+            cron_ownership.register_bot_identity(adapter)
+        except Exception:
+            logger.debug("zulip bot identity registration failed", exc_info=True)
         # Warn about reaction-trigger blind spots: Zulip only delivers
         # ``reaction`` events for streams the bot is subscribed to. (#164)
         await adapter._check_reaction_trigger_subscriptions()

@@ -78,19 +78,36 @@ def profiles_root_for(adapter: Any) -> Optional[Path]:
 _bot_lock = threading.RLock()
 _bot_id_to_profile: dict[str, str] = {}
 _bot_email_to_profile: dict[str, str] = {}
+# Mention label (profile name, full name, email local-part) -> profile.
+_bot_alias_to_profile: dict[str, str] = {}
+
+
+def _remember_alias(alias: str, profile: str) -> None:
+    key = (alias or "").strip().lower()
+    if key and profile:
+        _bot_alias_to_profile[key] = profile
 
 
 def register_bot_identity(adapter: Any) -> None:
-    """Record this adapter's bot user id and email against its profile."""
+    """Record this adapter's bot user id, email, and mention names."""
     try:
         profile = own_profile_name(adapter)
         bot_id = getattr(adapter, "_bot_user_id", None)
         email = getattr(adapter, "email", None)
+        full_name = getattr(adapter, "bot_full_name", None)
         with _bot_lock:
             if bot_id is not None and str(bot_id).strip():
                 _bot_id_to_profile[str(bot_id).strip()] = profile
             if isinstance(email, str) and email.strip():
                 _bot_email_to_profile[email.strip().lower()] = profile
+            _remember_alias(profile, profile)
+            if isinstance(email, str) and email.strip():
+                local = email.split("@")[0].strip().lower()
+                _remember_alias(local, profile)
+                if local.endswith("-bot") and local[: -len("-bot")]:
+                    _remember_alias(local[: -len("-bot")], profile)
+            if isinstance(full_name, str):
+                _remember_alias(full_name, profile)
     except Exception:
         logger.debug("cron_ownership: bot identity registration failed", exc_info=True)
 
@@ -108,11 +125,83 @@ def profile_for_bot(sender_id: Any = None, sender_email: str = "") -> Optional[s
         return None
 
 
+def profile_for_alias(name: str) -> Optional[str]:
+    """Profile whose mention label is ``name``, or None when unregistered."""
+    key = (name or "").strip().lower()
+    if not key:
+        return None
+    with _bot_lock:
+        return _bot_alias_to_profile.get(key)
+
+
+def self_aliases(adapter: Any) -> set[str]:
+    """Mention labels that mean this adapter, whether or not it has registered."""
+    names: set[str] = set()
+    profile = own_profile_name(adapter)
+    if profile and profile.strip():
+        names.add(profile.strip().lower())
+    full_name = getattr(adapter, "bot_full_name", None)
+    if isinstance(full_name, str) and full_name.strip():
+        names.add(full_name.strip().lower())
+    email = getattr(adapter, "email", None)
+    if isinstance(email, str) and email.strip():
+        local = email.split("@")[0].strip().lower()
+        if local:
+            names.add(local)
+            if local.endswith("-bot") and local[: -len("-bot")]:
+                names.add(local[: -len("-bot")])
+    return names
+
+
+def profile_dir_names(adapter: Any) -> set[str]:
+    """Profile directory names next to this adapter, lowercased.
+
+    Each Hermes profile is one bot. A stream mention of that name is a bot
+    mention even before that bot has connected and registered its full name.
+    """
+    root = profiles_root_for(adapter)
+    if root is None:
+        return set()
+    try:
+        entries = root.iterdir()
+    except OSError:
+        return set()
+    names: set[str] = set()
+    for entry in entries:
+        try:
+            if entry.is_dir() and not entry.name.startswith("."):
+                names.add(entry.name.strip().lower())
+        except OSError:
+            continue
+    return names
+
+
+def classify_command_target(adapter: Any, target: str | None) -> str:
+    """``self``, ``other``, or ``none`` for a mention label on a slash command.
+
+    ``none`` is a human mention (or anything we cannot tie to a profile): the
+    command stays unnamed and the topic owner handles it.
+    """
+    key = (target or "").strip().lower()
+    if not key:
+        return "none"
+    if key in self_aliases(adapter):
+        return "self"
+    alias_profile = profile_for_alias(key)
+    me = own_profile_name(adapter).strip().lower()
+    if alias_profile:
+        return "self" if alias_profile.strip().lower() == me else "other"
+    if key in profile_dir_names(adapter):
+        return "self" if key == me else "other"
+    return "none"
+
+
 def reset_bot_registry_for_tests() -> None:
     """Clear the bot registry (tests only)."""
     with _bot_lock:
         _bot_id_to_profile.clear()
         _bot_email_to_profile.clear()
+        _bot_alias_to_profile.clear()
 
 
 # ---------------------------------------------------------------------------

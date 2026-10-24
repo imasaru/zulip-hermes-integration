@@ -2349,7 +2349,13 @@ class ZulipAdapter(BasePlatformAdapter):
             logger.warning(approval_outcomes.unresolved_authority_warning())
 
     async def gate_approval_decision(
-        self, *, message: dict, event: Any, msg_type: str, message_id: Any
+        self,
+        *,
+        message: dict,
+        event: Any,
+        msg_type: str,
+        message_id: Any,
+        enforce_pending: bool = True,
     ) -> bool:
         """Record an exec-approval decision, or refuse one that is not authorized.
 
@@ -2391,10 +2397,13 @@ class ZulipAdapter(BasePlatformAdapter):
             )
             return False
 
-        if not approval_routing.profile_owns_approval(session_key):
+        if enforce_pending and not approval_routing.profile_owns_approval(session_key):
             # Not ours: the gateway has nothing pending for this session, so
             # it would only answer "no pending". Stay silent instead; the
             # owning profile's adapter processes the decision normally.
+            # ``enforce_pending`` is false only when the message explicitly
+            # addressed this bot (mention or onchar): that bot still handles
+            # the command, and the authority check above still applies.
             logger.debug(
                 "zulip approval decision dropped: no pending approval "
                 "[session_key=%s sender=%s]",

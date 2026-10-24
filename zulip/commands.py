@@ -32,6 +32,73 @@ _APPROVAL_DECISION_RE = re.compile(r"^/(?:approve|deny)\b", re.IGNORECASE)
 
 _YOLO_RE = re.compile(r"^/yolo\b", re.IGNORECASE)
 
+# A bot mention may lead the command (``@**Bot** /cmd args``) or trail it
+# (``/cmd args @**Bot**``). ``strip_html_to_text`` reduces ``@**Bot**`` to
+# ``@Bot`` before this runs, so both the markup and the bare form are accepted.
+# The label may contain spaces (``@Home Manager``) and a Zulip ``|id`` suffix.
+_MARKUP_MENTION = r"_?\*\*[^*|]+?(?:\|\d+)?\*\*"
+_PLAIN_MENTION = r"[\w][\w.-]*(?:\s+[\w][\w.-]*)*(?:\|\d+)?"
+_MENTION_NAME = rf"(?:{_MARKUP_MENTION}|{_PLAIN_MENTION})"
+_LEADING_COMMAND_RE = re.compile(
+    rf"^@(?P<name>{_MENTION_NAME})\s+(?P<body>/[^\s].*)$",
+    re.DOTALL,
+)
+_TRAILING_COMMAND_RE = re.compile(
+    rf"^(?P<body>/[^\s]+(?:\s+.*?)?)\s+@(?P<name>{_MENTION_NAME})\s*$",
+    re.DOTALL,
+)
+
+
+def _mention_label(name: str) -> str:
+    """Display name inside one mention token, without markup or ``|id``."""
+    text = (name or "").strip()
+    if text.startswith("_**") and text.endswith("**"):
+        text = text[3:-2]
+    elif text.startswith("**") and text.endswith("**"):
+        text = text[2:-2]
+    if "|" in text:
+        text = text.split("|", 1)[0]
+    return text.strip()
+
+
+def _command_body(content: str) -> str:
+    """Command text with a leading ``@bot`` removed so the verb is first.
+
+    A trailing mention is left in place: ``/cmd args`` already parses, and
+    the argument may be a person rather than a target bot. Stream routing
+    strips a trailing bot mention itself once it knows the name is a bot.
+    """
+    text = (content or "").strip()
+    if not text:
+        return ""
+    lead = _LEADING_COMMAND_RE.match(text)
+    if lead:
+        return lead.group("body").strip()
+    return text
+
+
+def split_command_target(content: str) -> tuple[str, str | None] | None:
+    """Split a slash command into ``(bare_command, mention_label_or_None)``.
+
+    ``None`` when ``content`` is not a command. The bare command has a leading
+    or trailing mention removed so ``@**Bot** /cmd args`` and
+    ``/cmd args @**Bot**`` both yield ``/cmd args``. Callers that do not know
+    whether the label is a bot should keep the original text for a trailing
+    mention — see :func:`_command_body`.
+    """
+    text = (content or "").strip()
+    if not text:
+        return None
+    lead = _LEADING_COMMAND_RE.match(text)
+    if lead:
+        return lead.group("body").strip(), _mention_label(lead.group("name"))
+    if not text.startswith("/"):
+        return None
+    trail = _TRAILING_COMMAND_RE.match(text)
+    if trail:
+        return trail.group("body").strip(), _mention_label(trail.group("name"))
+    return text, None
+
 
 def is_yolo_command(content: str) -> bool:
     """Whether ``content`` is the host's ``/yolo`` toggle.
@@ -41,7 +108,7 @@ def is_yolo_command(content: str) -> bool:
     so the plugin can route it to the relevant profile instead of all six
     adapters answering at once.
     """
-    text = (content or "").strip()
+    text = _command_body(content)
     if not text:
         return False
     return bool(_YOLO_RE.match(text))
@@ -55,7 +122,7 @@ def is_approval_decision(content: str) -> bool:
     answered here: it still reaches the gateway, which owns slash authorization
     and the decision itself.
     """
-    text = (content or "").strip()
+    text = _command_body(content)
     if not text:
         return False
     return bool(_APPROVAL_DECISION_RE.match(text))
@@ -98,11 +165,14 @@ def register_command(name: str, handler: CommandHandler | None = None):
 def _extract_command(content: str) -> tuple[str, str] | None:
     """Parse \"/command arg1 arg2\" from message text.
 
-    Returns (cmd, args) or None if not a command.
+    A leading ``@bot`` is not part of the verb: ``@**Bot** /command args``
+    parses as ``command``. Returns (cmd, args) or None if not a command.
     """
-    stripped = content.strip()
+    stripped = _command_body(content)
     if stripped.startswith("/"):
         parts = stripped[1:].split(maxsplit=1)
+        if not parts or not parts[0]:
+            return None
         cmd = parts[0].lower()
         args = parts[1] if len(parts) > 1 else ""
         return cmd, args
@@ -139,8 +209,8 @@ def handle_command(
 
 
 def is_command(content: str) -> bool:
-    """Check if content looks like a command (starts with /)."""
-    return content.strip().startswith("/")
+    """Check if content looks like a command (starts with /, or ``@bot /cmd``)."""
+    return _command_body(content).startswith("/")
 
 
 # ------------------------------------------------------------------

@@ -174,6 +174,91 @@ async def _auto_reply_dispatch_prefix(
     return _ar.build_gating_prefix(profile=me, reason=route.reason)
 
 
+def _prepare_stream_command(
+    adapter: Any, content: str
+) -> tuple[str, str | None, str]:
+    """Rewrite a stream command when its mention names a known bot.
+
+    Returns ``(text, label_or_None, kind)`` where kind is ``self``,
+    ``other``, or ``none``. A human mention stays in the text so
+    ``/user @evan`` keeps its argument, and ``@evan /cmd`` stays a
+    non-command. Never raises.
+    """
+    try:
+        split = commands.split_command_target(content)
+    except Exception:
+        logger.debug("zulip command split failed", exc_info=True)
+        return content, None, "none"
+    if split is None:
+        return content, None, "none"
+    bare, target = split
+    if not target:
+        return content, None, "none"
+    try:
+        from . import cron_ownership as _co
+
+        kind = _co.classify_command_target(adapter, target)
+    except Exception:
+        logger.debug("zulip command target classify failed", exc_info=True)
+        return content, None, "none"
+    if kind in ("self", "other"):
+        return bare, target, kind
+    return content, None, "none"
+
+
+def _fallback_profile_matches(adapter: Any) -> bool:
+    """True when this adapter is the configured auto-reply fallback."""
+    try:
+        from . import auto_reply as _ar
+        from . import cron_ownership as _co
+
+        return _co.own_profile_name(adapter) == _ar.resolve_auto_reply_settings().fallback_profile
+    except Exception:
+        logger.debug("zulip slash command fallback lookup failed", exc_info=True)
+        return False
+
+
+async def _stream_slash_allowed(
+    adapter: Any,
+    message: dict,
+    content: str,
+    *,
+    was_mentioned: bool,
+    onchar_triggered: bool,
+    target_kind: str,
+    stream_name: str,
+    message_id: Any,
+) -> bool:
+    """Whether this adapter may act on a stream slash command.
+
+    An explicit address (this bot mentioned, or onchar) wins. A mention of
+    a different known bot drops. ``/approve``, ``/deny``, and ``/yolo`` keep
+    the gates further down. Any other unnamed command goes to the topic
+    owner, or the fallback profile when the topic has none.
+    """
+    if was_mentioned or onchar_triggered or target_kind == "self":
+        return True
+    if target_kind == "other":
+        return False
+    if is_approval_decision(content) or is_yolo_command(content):
+        return True
+    try:
+        from . import approval_routing as _route
+    except Exception:
+        logger.debug("zulip slash routing import failed", exc_info=True)
+        return _fallback_profile_matches(adapter)
+    try:
+        return await _route.should_process_topic_command(
+            adapter,
+            message,
+            stream_name=stream_name,
+            message_id=message_id,
+        )
+    except Exception:
+        logger.debug("zulip slash routing failed", exc_info=True)
+        return _fallback_profile_matches(adapter)
+
+
 async def handle_message(adapter: Any, message: dict) -> None:
     """Process one incoming Zulip message through the full inbound gate chain.
 
@@ -231,6 +316,17 @@ async def handle_message(adapter: Any, message: dict) -> None:
 
     # Strip Zulip @-mention syntax and HTML
     content = strip_html_to_text(content)
+    # Stream commands may name a bot before or after the verb. Rewrite only
+    # a known-bot mention, and keep the pre-rewrite text so mention detection
+    # still sees ``@bot /cmd``. DMs are not rewritten: the DM'd bot handles
+    # them. ``slash_explicitly_addressed`` is set inside the stream block.
+    pre_command_text = content
+    command_target_kind = "none"
+    slash_explicitly_addressed = False
+    if msg_type == "stream":
+        content, _command_target, command_target_kind = _prepare_stream_command(
+            adapter, content
+        )
     # Captured before any gating or prompt-prefixing, so it still identifies a
     # native slash command once a history block has been prepended below. The
     # per-session queue must never serialize these: the gateway answers them
@@ -271,6 +367,14 @@ async def handle_message(adapter: Any, message: dict) -> None:
         onchar_triggered, stripped = strip_onchar_prefix(content, onchar_prefixes)
         if onchar_triggered:
             content = stripped
+            # ``> /stop`` is not a slash command until the prefix is gone.
+            # Re-split so ``> @bot /cmd`` and ``> /cmd @bot`` route the same
+            # way as a bare command. Only this adapter's own prefix counts.
+            rewritten, _target, kind = _prepare_stream_command(adapter, content)
+            if rewritten.lstrip().startswith("/"):
+                content = rewritten
+                command_target_kind = kind
+                is_slash_command = True
 
         # Check mention (simple substring; bot username from email prefix)
         # Mention detection.
@@ -288,7 +392,15 @@ async def handle_message(adapter: Any, message: dict) -> None:
         )
         was_mentioned = "mentioned" in (message.get("flags") or [])
         if not was_mentioned and mention_regex:
-            was_mentioned = bool(mention_regex.search(content))
+            # ``pre_command_text`` still has a leading ``@bot`` that the
+            # rewrite removed from ``content``.
+            was_mentioned = bool(
+                mention_regex.search(pre_command_text)
+                or mention_regex.search(content)
+            )
+        if command_target_kind == "self":
+            was_mentioned = True
+        slash_explicitly_addressed = bool(was_mentioned or onchar_triggered)
 
         # Apply gating
         #
@@ -495,6 +607,47 @@ async def handle_message(adapter: Any, message: dict) -> None:
                 adapter._policy.group_mode,
                 mask_pii(sender_email),
                 mask_pii(str(message.get("display_recipient", ""))),
+            )
+            return
+
+        # Slash commands bypass the trigger gate (issue #259) so /approve,
+        # /deny, /model, and /stop are not mention-dropped. Every profile's
+        # adapter sees the same stream message, so without this check each
+        # one would run the command. The check sits after rate limit, stream
+        # filter, and group policy — those keep their order — and before
+        # engagement side effects. A drop observes and does not reply.
+        # /approve, /deny, and /yolo stay allowed here; their own gates
+        # below pick the one profile that answers.
+        if is_slash_command and not await _stream_slash_allowed(
+            adapter,
+            message,
+            content,
+            was_mentioned=was_mentioned,
+            onchar_triggered=onchar_triggered,
+            target_kind=command_target_kind,
+            stream_name=str(message.get("display_recipient", "")),
+            message_id=message_id,
+        ):
+            try:
+                from .topic_ingest import ingest_message
+
+                ingest_message(
+                    adapter, message, pre_resolved=pre_resolved_conversation
+                )
+            except Exception:
+                logger.debug("zulip topic-session ingest failed", exc_info=True)
+            if adapter._observe_group and not addressed:
+                adapter._observe_stream_message(message, pre_command_text)
+            try:
+                await adapter._mark_read(message_id)
+            except Exception:
+                logger.debug("zulip slash command mark-read failed", exc_info=True)
+            logger.info(
+                "zulip drop [slash command not for this profile] stream=%s "
+                "topic=%s msg=%s",
+                mask_pii(str(message.get("display_recipient", ""))),
+                mask_pii(str(message.get("subject", ""))),
+                mask_pii(str(message_id)),
             )
             return
 
@@ -880,7 +1033,13 @@ async def handle_message(adapter: Any, message: dict) -> None:
     # fires.
     if is_command(content) and is_approval_decision(content):
         if not await adapter.gate_approval_decision(
-            message=message, event=event, msg_type=msg_type, message_id=message_id
+            message=message,
+            event=event,
+            msg_type=msg_type,
+            message_id=message_id,
+            # A mention or onchar names this bot; pending-ownership does not
+            # also have to match. Authority (#228) still applies inside the gate.
+            enforce_pending=not slash_explicitly_addressed,
         ):
             return
 
@@ -891,7 +1050,8 @@ async def handle_message(adapter: Any, message: dict) -> None:
     # Only the relevant profile acts: one with a pending approval, else the
     # topic's cron owner (or the configured fallback), settled by the
     # per-message claim. Everyone else marks read and stays silent.
-    if is_command(content) and is_yolo_command(content):
+    # An explicit mention/onchar already selected this adapter above.
+    if is_command(content) and is_yolo_command(content) and not slash_explicitly_addressed:
         if not await _yolo_routing_allows(
             adapter,
             message,
